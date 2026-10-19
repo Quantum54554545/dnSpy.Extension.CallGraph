@@ -115,18 +115,6 @@ Open a method and select `View -> Call Graph`, press `Ctrl+Alt+G`, or use `Show 
 4. Select `Call blocks`, `Function map`, or `CFG`.
 5. For a call graph, choose its direction, depth, and node limit.
 
-### Mouse Controls
-
-| Action | Result |
-| --- | --- |
-| Mouse wheel | Zoom around the cursor |
-| Drag with the left or middle mouse button | Pan the graph |
-| Single-click a node | Select the method and show its details |
-| Double-click a method | Make the method the new graph root |
-| Right-click | Open navigation, source, and copy actions |
-
-The zoom range is 1% to 400%. Text uses grayscale rendering to reduce colored ClearType artifacts at low zoom levels.
-
 ### Context Menu
 
 - `Explore calls from here` — make the method the graph root;
