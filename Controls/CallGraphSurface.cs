@@ -149,7 +149,8 @@ namespace dnSpy.CallGraph.Controls {
 				CallGraphIndex.Signature(node.Method),
 				CallGraphIndex.DisplayName(node.Method))).ToArray();
 			var links = slice.Links.Select(link => new GraphLinkPresentation(
-				link.Source, link.Target, link.CallSiteCount, BuildLinkToolTip(link))).ToArray();
+				link.Source, link.Target, link.CallSiteCount, BuildLinkToolTip(link),
+				string.Empty, link.IsPotential ? GraphLinkKind.PossibleCall : GraphLinkKind.Call)).ToArray();
 			RenderCore(new GraphPresentation(nodes, links),
 				snippets.ToDictionary(pair => (object)pair.Key, pair => pair.Value),
 				UiText.Pick("No calls were found for the selected method.", "Для выбранного метода вызовы не найдены."), false);
@@ -335,7 +336,7 @@ namespace dnSpy.CallGraph.Controls {
 				ToolTip = link.ToolTip,
 				IsHitTestVisible = true,
 			};
-			if (link.Kind == GraphLinkKind.Exception)
+			if (link.Kind == GraphLinkKind.Exception || link.Kind == GraphLinkKind.PossibleCall)
 				path.StrokeDashArray = new DoubleCollection { 4, 3 };
 			path.SetResourceReference(Shape.StrokeProperty,
 				Equals(link.Source, root_reference) || Equals(link.Target, root_reference) ||
@@ -355,7 +356,10 @@ namespace dnSpy.CallGraph.Controls {
 			string offsets = string.Join(", ", link.IlOffsets.Take(10).Select(offset => "IL_" + offset.ToString("X4", CultureInfo.InvariantCulture)));
 			if (link.IlOffsets.Count > 10)
 				offsets += ", …";
-			return $"{CallGraphIndex.DisplayName(link.Source)} → {CallGraphIndex.DisplayName(link.Target)}\n" +
+			string resolution = link.IsPotential
+				? UiText.Pick("Possible runtime target (static inference)\n", "Возможная runtime-цель (статический вывод)\n")
+				: string.Empty;
+			return $"{CallGraphIndex.DisplayName(link.Source)} → {CallGraphIndex.DisplayName(link.Target)}\n" + resolution +
 				$"{link.CallSiteCount} call site(s): {string.Join(", ", link.OpCodes)}\n{offsets}";
 		}
 

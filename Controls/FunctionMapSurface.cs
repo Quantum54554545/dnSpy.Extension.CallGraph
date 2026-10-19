@@ -22,9 +22,11 @@ namespace dnSpy.CallGraph.Controls {
 		StreamGeometry? edge_geometry;
 		StreamGeometry? incoming_edge_geometry;
 		StreamGeometry? outgoing_edge_geometry;
+		StreamGeometry? possible_edge_geometry;
 		StreamGeometry? edge_arrow_geometry;
 		StreamGeometry? incoming_arrow_geometry;
 		StreamGeometry? outgoing_arrow_geometry;
+		StreamGeometry? possible_arrow_geometry;
 		StreamGeometry? caller_geometry;
 		StreamGeometry? callee_geometry;
 		StreamGeometry? neutral_geometry;
@@ -53,7 +55,9 @@ namespace dnSpy.CallGraph.Controls {
 			root = hovered = selected = null;
 			positions.Clear();
 			edge_geometry = incoming_edge_geometry = outgoing_edge_geometry = null;
+			possible_edge_geometry = null;
 			edge_arrow_geometry = incoming_arrow_geometry = outgoing_arrow_geometry = null;
+			possible_arrow_geometry = null;
 			caller_geometry = callee_geometry = neutral_geometry = null;
 			InvalidateVisual();
 		}
@@ -116,22 +120,28 @@ namespace dnSpy.CallGraph.Controls {
 			var edges = new StreamGeometry();
 			var incoming_edges = new StreamGeometry();
 			var outgoing_edges = new StreamGeometry();
+			var possible_edges = new StreamGeometry();
 			var edge_arrows = new StreamGeometry();
 			var incoming_arrows = new StreamGeometry();
 			var outgoing_arrows = new StreamGeometry();
+			var possible_arrows = new StreamGeometry();
 			using (var edge_context = edges.Open())
 			using (var incoming_context = incoming_edges.Open())
 			using (var outgoing_context = outgoing_edges.Open())
+			using (var possible_context = possible_edges.Open())
 			using (var edge_arrow_context = edge_arrows.Open())
 			using (var incoming_arrow_context = incoming_arrows.Open())
-			using (var outgoing_arrow_context = outgoing_arrows.Open()) {
+			using (var outgoing_arrow_context = outgoing_arrows.Open())
+			using (var possible_arrow_context = possible_arrows.Open()) {
 				foreach (var link in slice.Links) {
 					if (!positions.TryGetValue(link.Source, out var from) || !positions.TryGetValue(link.Target, out var to))
 						continue;
 					bool incoming = link.Target == root;
 					bool outgoing = link.Source == root;
-					var context = incoming ? incoming_context : outgoing ? outgoing_context : edge_context;
-					var arrow_context = incoming ? incoming_arrow_context : outgoing ? outgoing_arrow_context : edge_arrow_context;
+					var context = link.IsPotential ? possible_context :
+						incoming ? incoming_context : outgoing ? outgoing_context : edge_context;
+					var arrow_context = link.IsPotential ? possible_arrow_context :
+						incoming ? incoming_arrow_context : outgoing ? outgoing_arrow_context : edge_arrow_context;
 					context.BeginFigure(from, false, false);
 					context.LineTo(to, true, false);
 					AppendArrow(arrow_context, from, to, link.Target == root ? 11 : 7, incoming || outgoing ? 5.4 : 3.8);
@@ -140,15 +150,19 @@ namespace dnSpy.CallGraph.Controls {
 			edges.Freeze();
 			incoming_edges.Freeze();
 			outgoing_edges.Freeze();
+			possible_edges.Freeze();
 			edge_arrows.Freeze();
 			incoming_arrows.Freeze();
 			outgoing_arrows.Freeze();
+			possible_arrows.Freeze();
 			edge_geometry = edges;
 			incoming_edge_geometry = incoming_edges;
 			outgoing_edge_geometry = outgoing_edges;
+			possible_edge_geometry = possible_edges;
 			edge_arrow_geometry = edge_arrows;
 			incoming_arrow_geometry = incoming_arrows;
 			outgoing_arrow_geometry = outgoing_arrows;
+			possible_arrow_geometry = possible_arrows;
 
 			var callers = new StreamGeometry();
 			var callees = new StreamGeometry();
@@ -209,6 +223,15 @@ namespace dnSpy.CallGraph.Controls {
 			var caller_brush = ResourceBrush("SearchMatchHighlight", Color.FromRgb(95, 145, 225));
 			var callee_brush = ResourceBrush("HyperlinkNormal", Color.FromRgb(75, 190, 170));
 			var accent = ResourceBrush("HyperlinkNormal", Color.FromRgb(86, 190, 235));
+			if (possible_edge_geometry is not null) {
+				var possible_pen = new Pen(accent, 1.05 / Math.Sqrt(zoom)) {
+					DashStyle = new DashStyle(new[] { 4.0, 3.0 }, 0),
+				};
+				drawing_context.PushOpacity(0.52);
+				drawing_context.DrawGeometry(null, possible_pen, possible_edge_geometry);
+				drawing_context.DrawGeometry(accent, null, possible_arrow_geometry);
+				drawing_context.Pop();
+			}
 			if (edge_geometry is not null) {
 				drawing_context.PushOpacity(0.22);
 				drawing_context.DrawGeometry(null, new Pen(text_brush, 0.75 / Math.Sqrt(zoom)), edge_geometry);
@@ -275,6 +298,7 @@ namespace dnSpy.CallGraph.Controls {
 		void DrawLegend(DrawingContext drawing_context, Brush caller_brush, Brush callee_brush) {
 			if (ActualWidth < 280 || ActualHeight < 90)
 				return;
+			bool has_possible_targets = slice?.Links.Any(link => link.IsPotential) == true;
 			double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
 			var typeface = new Typeface("Segoe UI Semibold");
 			var callers = new FormattedText(UiText.MapLegendCallers, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
@@ -283,6 +307,8 @@ namespace dnSpy.CallGraph.Controls {
 				typeface, 10.5, ResourceBrush("SystemColorsWindowText", Colors.Gainsboro), dpi);
 			var callees = new FormattedText(UiText.MapLegendCallees, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
 				typeface, 10.5, callee_brush, dpi);
+			var possible = new FormattedText(UiText.MapLegendPossible, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+				typeface, 9.5, ResourceBrush("SystemColorsGrayText", Colors.Silver), dpi);
 			double x = 18;
 			double first_arrow_start = x + callers.Width + 10;
 			double first_arrow_end = first_arrow_start + 25;
@@ -290,13 +316,21 @@ namespace dnSpy.CallGraph.Controls {
 			double second_arrow_start = root_x + root_text.Width + 10;
 			double second_arrow_end = second_arrow_start + 25;
 			double callees_x = second_arrow_end + 7;
-			var panel = new Rect(8, 8, callees_x + callees.Width + 10, 31);
+			double panel_width = Math.Max(callees_x + callees.Width + 10, has_possible_targets ? possible.Width + 59 : 0);
+			var panel = new Rect(8, 8, panel_width, has_possible_targets ? 51 : 31);
 			DrawOverlayPanel(drawing_context, panel);
 			drawing_context.DrawText(callers, new Point(x, 16));
 			drawing_context.DrawText(root_text, new Point(root_x, 16));
 			drawing_context.DrawText(callees, new Point(callees_x, 16));
 			DrawLegendArrow(drawing_context, new Point(first_arrow_start, 23), new Point(first_arrow_end, 23), caller_brush);
 			DrawLegendArrow(drawing_context, new Point(second_arrow_start, 23), new Point(second_arrow_end, 23), callee_brush);
+			if (has_possible_targets) {
+				var possible_pen = new Pen(ResourceBrush("HyperlinkNormal", Color.FromRgb(86, 190, 235)), 1.2) {
+					DashStyle = new DashStyle(new[] { 4.0, 3.0 }, 0),
+				};
+				drawing_context.DrawLine(possible_pen, new Point(x, 42), new Point(x + 28, 42));
+				drawing_context.DrawText(possible, new Point(x + 36, 34));
+			}
 		}
 
 		static void DrawLegendArrow(DrawingContext drawing_context, Point from, Point to, Brush brush) {

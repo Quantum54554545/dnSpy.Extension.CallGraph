@@ -412,12 +412,7 @@ namespace dnSpy.CallGraph {
 				if (!modules.Contains(root.Module))
 					modules.Insert(0, root.Module);
 				var index = current_index;
-				if (direction == CallGraphDirection.Callees && !current_index_covers_all_loaded_modules) {
-					index = await BuildCalleeIndexAsync(root, modules, depth, node_limit, filters, cancellation_token);
-					current_index = index;
-					current_index_covers_all_loaded_modules = false;
-				}
-				else if (index is null || !current_index_covers_all_loaded_modules || !index.ContainsModule(root.Module)) {
+				if (index is null || !current_index_covers_all_loaded_modules || !index.ContainsModule(root.Module)) {
 					var module_indexes = await GetOrBuildModuleIndexesAsync(modules, cancellation_token);
 					index = await Task.Run(() => CallGraphIndex.Combine(module_indexes), cancellation_token);
 					cancellation_token.ThrowIfCancellationRequested();
@@ -564,31 +559,6 @@ namespace dnSpy.CallGraph {
 				}
 			}
 			return modules.Select(module => available[module]).ToList();
-		}
-
-		async Task<CallGraphIndex> BuildCalleeIndexAsync(MethodDef root, IReadOnlyList<ModuleDef> loaded_modules,
-			int depth, int node_limit, CallGraphFilterOptions filters, CancellationToken cancellation_token) {
-			var loaded = new HashSet<ModuleDef>(loaded_modules);
-			var selected = new Dictionary<ModuleDef, CallGraphIndex>();
-			var root_indexes = await GetOrBuildModuleIndexesAsync(new[] { root.Module! }, cancellation_token);
-			selected[root.Module!] = root_indexes[0];
-			for (int pass = 0; pass < depth; pass++) {
-				var combined = await Task.Run(() => CallGraphIndex.Combine(selected.Values), cancellation_token);
-				cancellation_token.ThrowIfCancellationRequested();
-				var slice = combined.Select(root, CallGraphDirection.Callees, depth, node_limit, filters);
-				var missing = slice.Nodes
-					.Where(node => node.Layer < depth && node.Method.Module is ModuleDef module &&
-						loaded.Contains(module) && !selected.ContainsKey(module))
-					.Select(node => node.Method.Module!)
-					.Distinct()
-					.ToArray();
-				if (missing.Length == 0)
-					return combined;
-				var added = await GetOrBuildModuleIndexesAsync(missing, cancellation_token);
-				foreach (var module_index in added)
-					selected[module_index.Module!] = module_index;
-			}
-			return await Task.Run(() => CallGraphIndex.Combine(selected.Values), cancellation_token);
 		}
 
 		List<ModuleDef> GetLoadedModules() => document_tab_service.DocumentTreeView.DocumentService.GetDocuments()

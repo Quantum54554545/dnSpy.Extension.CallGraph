@@ -4,6 +4,7 @@ using System.Collections.Generic;
 namespace dnSpy.CallGraph.Core {
 	enum GraphLinkKind {
 		Call,
+		PossibleCall,
 		FallThrough,
 		Conditional,
 		Switch,

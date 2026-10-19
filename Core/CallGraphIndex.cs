@@ -108,14 +108,16 @@ namespace dnSpy.CallGraph.Core {
 		public int CallSiteCount { get; }
 		public IReadOnlyList<uint> IlOffsets { get; }
 		public IReadOnlyList<string> OpCodes { get; }
+		public bool IsPotential { get; }
 
 		public CallGraphLink(MethodDef source, MethodDef target, int call_site_count,
-			IReadOnlyList<uint> il_offsets, IReadOnlyList<string> op_codes) {
+			IReadOnlyList<uint> il_offsets, IReadOnlyList<string> op_codes, bool is_potential = false) {
 			Source = source;
 			Target = target;
 			CallSiteCount = call_site_count;
 			IlOffsets = il_offsets;
 			OpCodes = op_codes;
+			IsPotential = is_potential;
 		}
 	}
 
@@ -146,18 +148,70 @@ namespace dnSpy.CallGraph.Core {
 		}
 	}
 
-	sealed class CallGraphIndex {
-		sealed class CallSiteAccumulator {
-			public int Count;
-			public readonly HashSet<uint> Offsets = new HashSet<uint>();
-			public readonly HashSet<string> OpCodes = new HashSet<string>(StringComparer.Ordinal);
+	sealed class CallSiteAccumulator {
+		public int Count;
+		public bool HasDirect;
+		public readonly HashSet<uint> Offsets = new HashSet<uint>();
+		public readonly HashSet<string> Operations = new HashSet<string>(StringComparer.Ordinal);
+
+		public void Add(uint offset, string operation, bool is_potential) {
+			if (Offsets.Add(offset))
+				Count++;
+			Operations.Add(operation);
+			if (!is_potential)
+				HasDirect = true;
 		}
 
+		public void Add(CallGraphLink link) {
+			Offsets.UnionWith(link.IlOffsets);
+			Operations.UnionWith(link.OpCodes);
+			Count = Math.Max(Count, Math.Max(link.CallSiteCount, Offsets.Count));
+			if (!link.IsPotential)
+				HasDirect = true;
+		}
+	}
+
+	sealed class VirtualCallSite {
+		public MethodDef Source { get; }
+		public MethodDef Declaration { get; }
+		public uint Offset { get; }
+		public string Operation { get; }
+
+		public VirtualCallSite(MethodDef source, MethodDef declaration, uint offset, string operation) {
+			Source = source;
+			Declaration = declaration;
+			Offset = offset;
+			Operation = operation;
+		}
+	}
+
+	sealed class ReflectionTarget {
+		public MethodDef Source { get; }
+		public IReadOnlyList<string> TypeNames { get; }
+		public IReadOnlyList<string> MethodNames { get; }
+		public IReadOnlyList<MethodDef> ExactMethods { get; }
+		public uint Offset { get; }
+		public string Operation { get; }
+
+		public ReflectionTarget(MethodDef source, IEnumerable<string> type_names, IEnumerable<string> method_names,
+			IEnumerable<MethodDef> exact_methods, uint offset, string operation) {
+			Source = source;
+			TypeNames = type_names.Distinct(StringComparer.Ordinal).ToArray();
+			MethodNames = method_names.Distinct(StringComparer.Ordinal).ToArray();
+			ExactMethods = exact_methods.Distinct().ToArray();
+			Offset = offset;
+			Operation = operation;
+		}
+	}
+
+	sealed class CallGraphIndex {
 		readonly Dictionary<MethodDef, CallGraphLink[]> outgoing;
 		readonly Dictionary<MethodDef, CallGraphLink[]> incoming;
 		readonly HashSet<MethodDef> module_methods;
 		readonly HashSet<ModuleDef> modules;
 		readonly CallGraphLink[] all_links;
+		readonly VirtualCallSite[] virtual_call_sites;
+		readonly ReflectionTarget[] reflection_targets;
 
 		public ModuleDef? Module { get; }
 		public IReadOnlyCollection<ModuleDef> Modules => modules;
@@ -168,93 +222,137 @@ namespace dnSpy.CallGraph.Core {
 		public IReadOnlyList<CallGraphLink> AllLinks => all_links;
 
 		CallGraphIndex(ModuleDef? module, HashSet<ModuleDef> modules, HashSet<MethodDef> module_methods,
-			Dictionary<MethodDef, CallGraphLink[]> outgoing,
-			Dictionary<MethodDef, CallGraphLink[]> incoming, int link_count, int skipped_method_count) {
+			Dictionary<MethodDef, CallGraphLink[]> outgoing, Dictionary<MethodDef, CallGraphLink[]> incoming,
+			IEnumerable<VirtualCallSite> virtual_call_sites, IEnumerable<ReflectionTarget> reflection_targets,
+			int skipped_method_count) {
 			Module = module;
 			this.modules = modules;
 			this.module_methods = module_methods;
 			this.outgoing = outgoing;
 			this.incoming = incoming;
-			LinkCount = link_count;
+			this.virtual_call_sites = virtual_call_sites.ToArray();
+			this.reflection_targets = reflection_targets.ToArray();
 			SkippedMethodCount = skipped_method_count;
 			all_links = outgoing.Values.SelectMany(value => value).Distinct().ToArray();
+			LinkCount = all_links.Length;
 		}
 
 		public static CallGraphIndex Build(ModuleDef module, CancellationToken cancellation_token = default) {
 			if (module is null)
 				throw new ArgumentNullException(nameof(module));
-
 			var methods = EnumerateMethods(module, cancellation_token).OrderBy(SafeToken).ToArray();
-			var method_set = new HashSet<MethodDef>(methods);
 			var call_sites = new Dictionary<(MethodDef Source, MethodDef Target), CallSiteAccumulator>();
+			var virtual_sites = new List<VirtualCallSite>();
+			var reflection_sites = new List<ReflectionTarget>();
 			var resolved_methods = new Dictionary<IMethod, MethodDef?>();
 			int skipped = 0;
-
 			foreach (var method in methods) {
 				cancellation_token.ThrowIfCancellationRequested();
 				try {
 					if (!method.HasBody || method.Body?.Instructions is null)
 						continue;
 					foreach (var instruction in method.Body.Instructions) {
-						if (!IsCallInstruction(instruction.OpCode.Code) || instruction.Operand is not IMethod reference)
+						if (!IsDirectCallInstruction(instruction.OpCode.Code) || instruction.Operand is not IMethod reference)
 							continue;
 						var target = Resolve(reference, resolved_methods);
 						if (target is null)
 							continue;
-						var key = (method, target);
-						if (!call_sites.TryGetValue(key, out var accumulator))
-							call_sites.Add(key, accumulator = new CallSiteAccumulator());
-						accumulator.Count++;
-						accumulator.Offsets.Add(instruction.Offset);
-						accumulator.OpCodes.Add(instruction.OpCode.Name ?? instruction.OpCode.Code.ToString());
+						AddCallSite(call_sites, method, target, instruction.Offset,
+							instruction.OpCode.Name ?? instruction.OpCode.Code.ToString(), false);
+						if (instruction.OpCode.Code == Code.Callvirt && IsPolymorphic(target))
+							virtual_sites.Add(new VirtualCallSite(method, target, instruction.Offset, "possible callvirt target"));
 					}
+					AdvancedCallAnalysis.Scan(method, resolved_methods, call_sites, virtual_sites,
+						reflection_sites, cancellation_token);
 				}
 				catch (OperationCanceledException) { throw; }
 				catch (Exception) { skipped++; }
 			}
-
-			var links = call_sites
-				.Select(pair => new CallGraphLink(pair.Key.Source, pair.Key.Target, pair.Value.Count,
-					pair.Value.Offsets.OrderBy(offset => offset).ToArray(),
-					pair.Value.OpCodes.OrderBy(name => name, StringComparer.Ordinal).ToArray()))
-				.OrderBy(link => SafeToken(link.Source))
-				.ThenBy(link => DisplayName(link.Target), StringComparer.OrdinalIgnoreCase)
-				.ToArray();
-
-			var outgoing = links.GroupBy(link => link.Source)
-				.ToDictionary(group => group.Key, group => group.ToArray());
-			var incoming = links.GroupBy(link => link.Target)
-				.ToDictionary(group => group.Key, group => group.ToArray());
-			return new CallGraphIndex(module, new HashSet<ModuleDef> { module }, method_set,
-				outgoing, incoming, links.Length, skipped);
+			return Create(module, new HashSet<ModuleDef> { module }, new HashSet<MethodDef>(methods),
+				call_sites, virtual_sites, reflection_sites, skipped);
 		}
 
 		public static CallGraphIndex Combine(IEnumerable<CallGraphIndex> module_indexes) {
 			if (module_indexes is null)
 				throw new ArgumentNullException(nameof(module_indexes));
-			var indexes = module_indexes
-				.Where(index => index is not null)
-				.SelectMany(index => index.Module is ModuleDef module
-					? new[] { (Module: module, Index: index) }
-					: Array.Empty<(ModuleDef Module, CallGraphIndex Index)>())
-				.GroupBy(pair => pair.Module)
-				.Select(group => group.Last().Index)
+			var indexes = module_indexes.Where(index => index?.Module is not null)
+				.GroupBy(index => index.Module!)
+				.Select(group => group.Last())
 				.ToArray();
 			if (indexes.Length == 0)
 				throw new ArgumentException("At least one single-module index is required.", nameof(module_indexes));
-			if (indexes.Length == 1)
-				return indexes[0];
-
 			var modules = new HashSet<ModuleDef>(indexes.Select(index => index.Module!));
 			var methods = new HashSet<MethodDef>(indexes.SelectMany(index => index.module_methods));
-			var links = indexes.SelectMany(index => index.all_links).Distinct().ToArray();
-			var outgoing = links.GroupBy(link => link.Source)
-				.ToDictionary(group => group.Key, group => group.ToArray());
-			var incoming = links.GroupBy(link => link.Target)
-				.ToDictionary(group => group.Key, group => group.ToArray());
-			return new CallGraphIndex(null, modules, methods, outgoing, incoming, links.Length,
-				indexes.Sum(index => index.SkippedMethodCount));
+			var call_sites = new Dictionary<(MethodDef Source, MethodDef Target), CallSiteAccumulator>();
+			foreach (var link in indexes.SelectMany(index => index.all_links)) {
+				var key = (link.Source, link.Target);
+				if (!call_sites.TryGetValue(key, out var accumulator))
+					call_sites.Add(key, accumulator = new CallSiteAccumulator());
+				accumulator.Add(link);
+			}
+			WorkspaceCallResolver.AddExtendedEdges(methods, indexes.SelectMany(index => index.virtual_call_sites),
+				indexes.SelectMany(index => index.reflection_targets), call_sites);
+			return Create(indexes.Length == 1 ? indexes[0].Module : null, modules, methods, call_sites,
+				Array.Empty<VirtualCallSite>(), Array.Empty<ReflectionTarget>(), indexes.Sum(index => index.SkippedMethodCount));
 		}
+
+		static CallGraphIndex Create(ModuleDef? module, HashSet<ModuleDef> modules, HashSet<MethodDef> methods,
+			Dictionary<(MethodDef Source, MethodDef Target), CallSiteAccumulator> call_sites,
+			IEnumerable<VirtualCallSite> virtual_sites, IEnumerable<ReflectionTarget> reflection_sites, int skipped) {
+			var links = call_sites.Select(pair => new CallGraphLink(pair.Key.Source, pair.Key.Target,
+				pair.Value.Count, pair.Value.Offsets.OrderBy(offset => offset).ToArray(),
+				pair.Value.Operations.OrderBy(value => value, StringComparer.Ordinal).ToArray(), !pair.Value.HasDirect))
+				.OrderBy(link => SafeToken(link.Source))
+				.ThenBy(link => DisplayName(link.Target), StringComparer.OrdinalIgnoreCase)
+				.ToArray();
+			return new CallGraphIndex(module, modules, methods,
+				links.GroupBy(link => link.Source).ToDictionary(group => group.Key, group => group.ToArray()),
+				links.GroupBy(link => link.Target).ToDictionary(group => group.Key, group => group.ToArray()),
+				virtual_sites, reflection_sites, skipped);
+		}
+
+		internal static void AddCallSite(Dictionary<(MethodDef Source, MethodDef Target), CallSiteAccumulator> call_sites,
+			MethodDef source, MethodDef target, uint offset, string operation, bool is_potential) {
+			var key = (source, target);
+			if (!call_sites.TryGetValue(key, out var accumulator))
+				call_sites.Add(key, accumulator = new CallSiteAccumulator());
+			accumulator.Add(offset, operation, is_potential);
+		}
+
+		internal static MethodDef? Resolve(IMethod reference, Dictionary<IMethod, MethodDef?> cache) {
+			if (reference is MethodDef definition)
+				return definition;
+			if (cache.TryGetValue(reference, out var cached))
+				return cached;
+			MethodDef? result;
+			try { result = reference.ResolveMethodDef(); }
+			catch (Exception) { result = null; }
+			cache[reference] = result;
+			return result;
+		}
+
+		internal static string SafeTypeName(ITypeDefOrRef? type) {
+			try { return type?.FullName ?? string.Empty; }
+			catch (Exception) { return string.Empty; }
+		}
+
+		internal static string SafeMethodName(MethodDef method) {
+			try { return method.Name?.ToString() ?? string.Empty; }
+			catch (Exception) { return string.Empty; }
+		}
+
+		internal static uint SafeToken(MethodDef method) {
+			try { return method.MDToken.Raw; }
+			catch (Exception) { return uint.MaxValue; }
+		}
+
+		static bool IsPolymorphic(MethodDef method) {
+			try { return method.IsVirtual || method.DeclaringType?.IsInterface == true; }
+			catch (Exception) { return false; }
+		}
+
+		static bool IsDirectCallInstruction(Code code) =>
+			code == Code.Call || code == Code.Callvirt || code == Code.Newobj || code == Code.Jmp;
 
 		static IEnumerable<MethodDef> EnumerateMethods(ModuleDef module, CancellationToken cancellation_token) {
 			TypeDef[] roots;
@@ -278,33 +376,10 @@ namespace dnSpy.CallGraph.Core {
 			}
 		}
 
-		static bool IsCallInstruction(Code code) =>
-			code == Code.Call || code == Code.Callvirt || code == Code.Newobj || code == Code.Jmp ||
-			code == Code.Ldftn || code == Code.Ldvirtftn;
-
-		static MethodDef? Resolve(IMethod reference, Dictionary<IMethod, MethodDef?> cache) {
-			if (reference is MethodDef definition)
-				return definition;
-			if (cache.TryGetValue(reference, out var cached))
-				return cached;
-			MethodDef? result;
-			try { result = reference.ResolveMethodDef(); }
-			catch (Exception) { result = null; }
-			cache[reference] = result;
-			return result;
-		}
-
-		static uint SafeToken(MethodDef method) {
-			try { return method.MDToken.Raw; }
-			catch (Exception) { return uint.MaxValue; }
-		}
-
 		public bool Contains(MethodDef method) => module_methods.Contains(method);
 		public bool ContainsModule(ModuleDef module) => modules.Contains(module);
-
 		public IReadOnlyList<CallGraphLink> Outgoing(MethodDef method) =>
 			outgoing.TryGetValue(method, out var links) ? links : Array.Empty<CallGraphLink>();
-
 		public IReadOnlyList<CallGraphLink> Incoming(MethodDef method) =>
 			incoming.TryGetValue(method, out var links) ? links : Array.Empty<CallGraphLink>();
 
@@ -315,23 +390,19 @@ namespace dnSpy.CallGraph.Core {
 			var filter = filter_options ?? CallGraphFilterOptions.None;
 			var layers = new Dictionary<MethodDef, int> { [root] = 0 };
 			bool truncated = false;
-
 			if (direction != CallGraphDirection.Callers)
-				Traverse(root, depth, maximum_nodes, +1, outgoing, link => link.Target, filter, layers, ref truncated);
+				Traverse(root, depth, maximum_nodes, 1, outgoing, link => link.Target, filter, layers, ref truncated);
 			if (direction != CallGraphDirection.Callees)
 				Traverse(root, depth, maximum_nodes, -1, incoming, link => link.Source, filter, layers, ref truncated);
-
 			var visible = new HashSet<MethodDef>(layers.Keys);
 			var nodes = layers.Select(pair => new CallGraphNode(pair.Key, pair.Value, pair.Key == root,
 				!module_methods.Contains(pair.Key)))
 				.OrderBy(node => node.Layer)
 				.ThenBy(node => DisplayName(node.Method), StringComparer.OrdinalIgnoreCase)
 				.ToArray();
-
 			var links = visible.SelectMany(method => outgoing.TryGetValue(method, out var method_links)
 					? method_links : Array.Empty<CallGraphLink>())
-				.Where(link => visible.Contains(link.Target) &&
-					link.CallSiteCount >= filter.MinimumCallSiteCount)
+				.Where(link => visible.Contains(link.Target) && link.CallSiteCount >= filter.MinimumCallSiteCount)
 				.OrderBy(link => layers[link.Source])
 				.ThenBy(link => DisplayName(link.Source), StringComparer.OrdinalIgnoreCase)
 				.ThenBy(link => DisplayName(link.Target), StringComparer.OrdinalIgnoreCase)
@@ -358,8 +429,7 @@ namespace dnSpy.CallGraph.Core {
 						continue;
 					}
 					int next_depth = current.Depth + 1;
-					if (!layers.ContainsKey(next))
-						layers[next] = next_depth * layer_sign;
+					layers[next] = next_depth * layer_sign;
 					queue.Enqueue((next, next_depth));
 				}
 			}
@@ -375,9 +445,8 @@ namespace dnSpy.CallGraph.Core {
 
 		public static string Signature(MethodDef method) {
 			try {
-				string parameters = method.Parameters.Count == 0
-					? string.Empty
-					: string.Join(", ", method.Parameters.Where(parameter => !parameter.IsHiddenThisParameter)
+				string parameters = method.Parameters.Count == 0 ? string.Empty :
+					string.Join(", ", method.Parameters.Where(parameter => !parameter.IsHiddenThisParameter)
 						.Select(parameter => parameter.Type?.TypeName ?? "?"));
 				return $"{DisplayName(method)}({parameters})";
 			}

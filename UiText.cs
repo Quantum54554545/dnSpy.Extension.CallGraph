@@ -75,6 +75,7 @@ namespace dnSpy.CallGraph {
 		public static string MapLegendCallers => Pick("CALLERS", "ВЫЗЫВАЮЩИЕ");
 		public static string MapLegendRoot => Pick("ROOT", "КОРЕНЬ");
 		public static string MapLegendCallees => Pick("CALLEES", "ВЫЗЫВАЕМЫЕ");
+		public static string MapLegendPossible => Pick("DASHED: POSSIBLE RUNTIME TARGET", "ПУНКТИР: ВОЗМОЖНАЯ RUNTIME-ЦЕЛЬ");
 		public static string MapHint => Pick("Wheel: zoom  •  Drag: pan  •  Double-click: explore  •  Right-click: actions", "Колесо: масштаб  •  Перетаскивание: панорама  •  Двойной щелчок: исследовать  •  ПКМ: действия");
 		public static string MethodsLinks(int methods, int links, bool truncated) => Pick($"{methods} methods  •  {links} links" + (truncated ? "  •  limit reached" : string.Empty), $"Методов: {methods}  •  Связей: {links}" + (truncated ? "  •  достигнут лимит" : string.Empty));
 		public static string MethodInfo(int callers, int callees, int call_sites, int instructions, bool is_static) => Pick($"IL {instructions} instructions   •   {(is_static ? "static" : "instance")}\n{callers} callers   •   {callees} callees   •   {call_sites} call sites", $"IL-инструкций: {instructions}   •   {(is_static ? "статический" : "экземплярный")}\nВызывающих: {callers}   •   вызываемых: {callees}   •   мест вызова: {call_sites}");
