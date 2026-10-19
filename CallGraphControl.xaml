@@ -1,0 +1,84 @@
+<UserControl x:Class="dnSpy.CallGraph.CallGraphControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:dnSpy.CallGraph.Controls"
+             MinWidth="560" MinHeight="360"
+             Background="{DynamicResource SystemColorsWindow}">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="3" />
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="{DynamicResource EnvironmentBackground}"
+                BorderBrush="{DynamicResource CommonControlsTextBoxBorder}"
+                BorderThickness="0,0,0,1" Padding="4,3">
+            <StackPanel>
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                <Button x:Name="BackButton" Content="←" ToolTip="Previous graph root" Width="27" Height="23" IsEnabled="False" />
+                <Button x:Name="ForwardButton" Content="→" ToolTip="Next graph root" Width="27" Height="23" Margin="2,0,0,0" IsEnabled="False" />
+                <Border Width="1" Height="19" Margin="7,0" Background="{DynamicResource CommonControlsTextBoxBorder}" />
+                <Button x:Name="LoadSelectionButton" Content="Current selection" Height="23" Padding="7,0"
+                        ToolTip="Build the selected view for the current method" />
+                <Border Width="1" Height="19" Margin="7,0" Background="{DynamicResource CommonControlsTextBoxBorder}" />
+				<TextBlock x:Name="GraphLabel" Text="Graph" Margin="0,0,3,0" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsWindowText}" />
+                <ComboBox x:Name="ViewModeComboBox" Width="104" Height="23"
+                          ToolTip="Call blocks: code in method blocks&#x0a;Function map: fast constellation view&#x0a;CFG: IL basic blocks inside one method" />
+                <Border Width="1" Height="19" Margin="7,0" Background="{DynamicResource CommonControlsTextBoxBorder}" />
+				<TextBlock x:Name="CallsLabel" Text="Calls" Margin="0,0,3,0" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsWindowText}" />
+                <ComboBox x:Name="DirectionComboBox" Width="84" Height="23"
+                          ToolTip="Callees: what the selected block calls&#x0a;Callers: what calls the selected block&#x0a;Both: show both directions" />
+				<TextBlock x:Name="DepthLabel" Text="Depth" Margin="8,0,3,0" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsWindowText}" />
+                <ComboBox x:Name="DepthComboBox" Width="43" Height="23" />
+				<TextBlock x:Name="LimitLabel" Text="Limit" Margin="8,0,3,0" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsWindowText}" />
+                <ComboBox x:Name="NodeLimitComboBox" Width="58" Height="23" ToolTip="Maximum number of visible methods" />
+                <Border Width="1" Height="19" Margin="7,0" Background="{DynamicResource CommonControlsTextBoxBorder}" />
+				<TextBlock x:Name="CodeLabel" Text="Code" Margin="0,0,3,0" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsWindowText}" />
+                <ComboBox x:Name="LanguageComboBox" Width="59" Height="23" ToolTip="Decompiler used inside graph blocks" />
+                <Border Width="1" Height="19" Margin="7,0" Background="{DynamicResource CommonControlsTextBoxBorder}" />
+                <Button x:Name="CenterButton" Content="Center root" Height="23" Padding="7,0"
+                        ToolTip="Center the current root block" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,3,0,0" VerticalAlignment="Center">
+                <TextBlock x:Name="SearchLabel" Text="Search" Margin="3,0,6,0" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsWindowText}" />
+                <TextBox x:Name="SearchTextBox" Width="280" Height="23" Padding="4,1"
+                         ToolTip="Find a visible method by name, type, or signature" />
+                <Button x:Name="SearchPreviousButton" Content="↑" Width="27" Height="23" Margin="3,0,0,0"
+                        IsEnabled="False" />
+                <Button x:Name="SearchNextButton" Content="↓" Width="27" Height="23" Margin="2,0,0,0"
+                        IsEnabled="False" />
+                <Button x:Name="ClearSearchButton" Content="×" Width="27" Height="23" Margin="2,0,0,0"
+                        IsEnabled="False" />
+                <TextBlock x:Name="SearchResultText" Margin="7,0,0,0" MinWidth="70" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SystemColorsGrayText}" />
+            </StackPanel>
+            </StackPanel>
+        </Border>
+
+		<Border x:Name="GraphHostBorder" Grid.Row="1" BorderBrush="{DynamicResource CommonControlsTextBoxBorder}" BorderThickness="0,0,0,1"
+                ToolTip="Drag to pan • Mouse wheel to zoom • Double-click a method to explore it">
+            <Grid>
+                <controls:CallGraphSurface x:Name="GraphSurface" />
+                <controls:FunctionMapSurface x:Name="FunctionMapSurface" Visibility="Collapsed" />
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="2" Background="{DynamicResource EnvironmentBackground}"
+                BorderBrush="{DynamicResource CommonControlsTextBoxBorder}" BorderThickness="1,0,1,1"
+                Padding="7,3">
+            <TextBlock x:Name="StatusText" Text="Select a method and click Current method"
+                       Foreground="{DynamicResource SystemColorsWindowText}"
+                       TextTrimming="CharacterEllipsis" />
+        </Border>
+
+        <ProgressBar x:Name="BusyProgress" Grid.Row="3" IsIndeterminate="True" Visibility="Collapsed" />
+    </Grid>
+</UserControl>

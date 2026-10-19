@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>CallGraph.Extension.x</AssemblyName>
+    <RootNamespace>dnSpy.CallGraph</RootNamespace>
+    <Version>1.0.0</Version>
+    <Authors>dnSpy Call Graph contributors</Authors>
+    <Description>Call graph, function map, and IL control-flow graph extension for dnSpyEx.</Description>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+    <Deterministic>true</Deterministic>
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="dnSpy.Contracts.DnSpy">
+      <HintPath>$(DnSpyBinDir)\dnSpy.Contracts.DnSpy.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="dnSpy.Contracts.Logic">
+      <HintPath>$(DnSpyBinDir)\dnSpy.Contracts.Logic.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="dnlib">
+      <HintPath>$(DnSpyBinDir)\dnlib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.ComponentModel.Composition">
+      <HintPath>$(DnSpyBinDir)\System.ComponentModel.Composition.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.VisualStudio.Text.Data">
+      <HintPath>$(DnSpyBinDir)\Microsoft.VisualStudio.Text.Data.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateDnSpyBinDir" BeforeTargets="ResolveReferences"
+          Condition="!Exists('$(DnSpyBinDir)\dnSpy.Contracts.DnSpy.dll')">
+    <Error Text="Set DnSpyBinDir to the bin directory of your dnSpyEx installation." />
+  </Target>
+</Project>
