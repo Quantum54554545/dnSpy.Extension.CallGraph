@@ -1,4 +1,4 @@
-# Call Graph for dnSpyEx
+# dnSpy.Extension.CallGraph
 
 Call Graph is a dnSpyEx extension that adds three complementary views for analyzing .NET code:
 
