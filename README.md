@@ -8,7 +8,7 @@ Call Graph is a dnSpyEx extension that adds three complementary views for analyz
 
 The extension opens as a standard dnSpy document tab. It can be docked next to the decompiler, moved to another tab group, or placed where the decompiler normally appears.
 
-## Screenshots
+## GUI
 
 ### Call Blocks
 
