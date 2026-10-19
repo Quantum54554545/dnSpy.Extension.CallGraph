@@ -172,8 +172,10 @@ Independent assemblies are indexed in parallel, with a limited worker count to a
 
 ## Static Analysis Limitations
 
-- `calli`, reflection, late binding, and dynamically generated IL cannot be resolved reliably without runtime tracing;
-- `callvirt` identifies the metadata target but cannot enumerate every possible runtime override;
+- virtual dispatch is expanded from the currently loaded type hierarchy, but static analysis cannot know the exact runtime type or account for types loaded later;
+- reflection is resolved only when the target type, method name, or method handle remains statically known;
+- `calli` is resolved when an `ldftn` or `ldvirtftn` value can be followed through the evaluation stack and local variables; pointers loaded from fields, arrays, unmanaged memory, or native code remain unresolved;
+- late binding, dynamic proxies, and dynamically generated IL require runtime tracing for complete coverage;
 - assemblies that are not loaded in Assembly Explorer are not included in the workspace index;
 - severely malformed metadata may contain references that dnlib cannot resolve;
 - depth and node limits can hide part of the reachable graph.
