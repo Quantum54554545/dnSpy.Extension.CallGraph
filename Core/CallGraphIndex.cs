@@ -16,6 +16,7 @@ namespace dnSpy.CallGraph.Core {
 		public static readonly CallGraphFilterOptions None = new CallGraphFilterOptions();
 
 		public bool HideSystemMethods { get; }
+		public bool OnlyCurrentAssembly { get; }
 		public bool HideAccessors { get; }
 		public bool HideConstructors { get; }
 		public bool OnlyCurrentNamespace { get; }
@@ -25,7 +26,8 @@ namespace dnSpy.CallGraph.Core {
 
 		public CallGraphFilterOptions(bool hide_system_methods = false, bool hide_accessors = false,
 			bool hide_constructors = false, bool only_current_namespace = false, bool only_current_type = false,
-			bool require_method_body = false, int minimum_call_site_count = 1) {
+			bool require_method_body = false, int minimum_call_site_count = 1, bool only_current_assembly = false) {
+			OnlyCurrentAssembly = only_current_assembly;
 			HideSystemMethods = hide_system_methods;
 			HideAccessors = hide_accessors;
 			HideConstructors = hide_constructors;
@@ -38,6 +40,8 @@ namespace dnSpy.CallGraph.Core {
 		public bool Includes(MethodDef root, MethodDef method) {
 			if (ReferenceEquals(root, method))
 				return true;
+			if (OnlyCurrentAssembly && !ReferenceEquals(root.Module, method.Module) && (root.Module.Assembly is null || !ReferenceEquals(root.Module.Assembly, method.Module.Assembly)))
+				return false;
 			if (HideSystemMethods && IsSystemMethod(method))
 				return false;
 			if (HideAccessors && IsAccessor(method))
@@ -57,10 +61,7 @@ namespace dnSpy.CallGraph.Core {
 			link.CallSiteCount >= MinimumCallSiteCount && Includes(root, adjacent);
 
 		static bool IsAccessor(MethodDef method) {
-			string name = SafeName(method);
-			return name.StartsWith("get_", StringComparison.Ordinal) || name.StartsWith("set_", StringComparison.Ordinal) ||
-				name.StartsWith("add_", StringComparison.Ordinal) || name.StartsWith("remove_", StringComparison.Ordinal) ||
-				name.StartsWith("raise_", StringComparison.Ordinal);
+			return method.IsGetter || method.IsSetter || method.IsAddOn || method.IsRemoveOn || method.IsFire;
 		}
 
 		static bool IsConstructor(MethodDef method) {
@@ -69,16 +70,7 @@ namespace dnSpy.CallGraph.Core {
 		}
 
 		static bool IsSystemMethod(MethodDef method) {
-			string ns = Namespace(method);
-			if (ns == "System" || ns.StartsWith("System.", StringComparison.Ordinal) ||
-				ns == "Microsoft" || ns.StartsWith("Microsoft.", StringComparison.Ordinal))
-				return true;
-			string assembly = SafeAssemblyName(method);
-			return assembly.Equals("mscorlib", StringComparison.OrdinalIgnoreCase) ||
-				assembly.Equals("netstandard", StringComparison.OrdinalIgnoreCase) ||
-				assembly.Equals("System", StringComparison.OrdinalIgnoreCase) ||
-				assembly.StartsWith("System.", StringComparison.OrdinalIgnoreCase) ||
-				assembly.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase);
+			return FrameworkIdentity.IsFrameworkType(method.DeclaringType);
 		}
 
 		static string Namespace(MethodDef method) {
@@ -139,12 +131,21 @@ namespace dnSpy.CallGraph.Core {
 		public IReadOnlyList<CallGraphNode> Nodes { get; }
 		public IReadOnlyList<CallGraphLink> Links { get; }
 		public bool IsTruncated { get; }
+		public int UnresolvedIndirectCallCount { get; }
+		public IReadOnlyList<GraphDiagnostic> Diagnostics { get; }
+		readonly Dictionary<MethodDef, GraphDiagnostic[]> diagnostics_by_method;
+		public IReadOnlyList<GraphDiagnostic> DiagnosticsFor(MethodDef method) => diagnostics_by_method.TryGetValue(method, out var values) ? values : Array.Empty<GraphDiagnostic>();
 
 		public CallGraphSlice(IReadOnlyList<CallGraphNode> nodes,
-			IReadOnlyList<CallGraphLink> links, bool is_truncated) {
+			IReadOnlyList<CallGraphLink> links, bool is_truncated) : this(nodes, links, is_truncated, -1) { }
+		public CallGraphSlice(IReadOnlyList<CallGraphNode> nodes,
+			IReadOnlyList<CallGraphLink> links, bool is_truncated, int unresolved_indirect_call_count, IReadOnlyList<GraphDiagnostic>? diagnostics = null) {
 			Nodes = nodes;
 			Links = links;
 			IsTruncated = is_truncated;
+			UnresolvedIndirectCallCount = unresolved_indirect_call_count;
+			Diagnostics = diagnostics ?? Array.Empty<GraphDiagnostic>();
+			diagnostics_by_method = Diagnostics.GroupBy(item => item.Method).ToDictionary(group => group.Key, group => group.ToArray());
 		}
 	}
 
@@ -212,6 +213,7 @@ namespace dnSpy.CallGraph.Core {
 		readonly CallGraphLink[] all_links;
 		readonly VirtualCallSite[] virtual_call_sites;
 		readonly ReflectionTarget[] reflection_targets;
+		readonly Dictionary<MethodDef, uint[]> unresolved_calli = new Dictionary<MethodDef, uint[]>();
 
 		public ModuleDef? Module { get; }
 		public IReadOnlyCollection<ModuleDef> Modules => modules;
@@ -219,12 +221,15 @@ namespace dnSpy.CallGraph.Core {
 		public int MethodCount => module_methods.Count;
 		public int LinkCount { get; }
 		public int SkippedMethodCount { get; }
+		public bool IsReachableIndex { get; }
 		public IReadOnlyList<CallGraphLink> AllLinks => all_links;
+		IReadOnlyList<GraphDiagnostic> diagnostics = Array.Empty<GraphDiagnostic>();
 
 		CallGraphIndex(ModuleDef? module, HashSet<ModuleDef> modules, HashSet<MethodDef> module_methods,
 			Dictionary<MethodDef, CallGraphLink[]> outgoing, Dictionary<MethodDef, CallGraphLink[]> incoming,
 			IEnumerable<VirtualCallSite> virtual_call_sites, IEnumerable<ReflectionTarget> reflection_targets,
-			int skipped_method_count) {
+			int skipped_method_count, bool is_reachable_index = false) {
+			IsReachableIndex = is_reachable_index;
 			Module = module;
 			this.modules = modules;
 			this.module_methods = module_methods;
@@ -235,6 +240,33 @@ namespace dnSpy.CallGraph.Core {
 			SkippedMethodCount = skipped_method_count;
 			all_links = outgoing.Values.SelectMany(value => value).Distinct().ToArray();
 			LinkCount = all_links.Length;
+			foreach (var method in is_reachable_index ? Enumerable.Empty<MethodDef>() : module_methods) {
+				try {
+					if (!method.HasBody) continue;
+					var resolved = outgoing.TryGetValue(method, out var links)
+						? new HashSet<uint>(links.Where(link => link.OpCodes.Contains("calli")).SelectMany(link => link.IlOffsets)) : new HashSet<uint>();
+					var offsets = method.Body.Instructions.Where(instruction => instruction.OpCode.Code == Code.Calli && !resolved.Contains(instruction.Offset))
+						.Select(instruction => instruction.Offset).ToArray();
+					if (offsets.Length != 0) unresolved_calli.Add(method, offsets);
+				}
+				catch (Exception) { }
+			}
+		}
+
+		public static (CallGraphIndex Index, CallGraphSlice Slice) BuildReachable(MethodDef root,
+			IReadOnlyList<ModuleDef> loaded_modules, int depth, int maximum_nodes, CallGraphFilterOptions filters,
+			CancellationToken cancellation_token = default) => BuildReachableProgressive(root, loaded_modules, depth, maximum_nodes, filters, null, cancellation_token);
+		public static (CallGraphIndex Index, CallGraphSlice Slice) BuildReachableProgressive(MethodDef root,
+			IReadOnlyList<ModuleDef> loaded_modules, int depth, int maximum_nodes, CallGraphFilterOptions filters,
+			IProgress<CallGraphSlice>? progress, CancellationToken cancellation_token = default) {
+			var modules = new HashSet<ModuleDef>(loaded_modules) { root.Module };
+			var slice = new ReachableCallAnalysis(modules, cancellation_token).Select(root, depth, maximum_nodes, filters, progress);
+			var index = new CallGraphIndex(root.Module, modules,
+				new HashSet<MethodDef>(slice.Nodes.Where(node => !node.IsExternal).Select(node => node.Method)),
+				slice.Links.GroupBy(link => link.Source).ToDictionary(group => group.Key, group => group.ToArray()),
+				slice.Links.GroupBy(link => link.Target).ToDictionary(group => group.Key, group => group.ToArray()),
+				Array.Empty<VirtualCallSite>(), Array.Empty<ReflectionTarget>(), 0, true);
+			return (index, slice);
 		}
 
 		public static CallGraphIndex Build(ModuleDef module, CancellationToken cancellation_token = default) {
@@ -245,13 +277,19 @@ namespace dnSpy.CallGraph.Core {
 			var virtual_sites = new List<VirtualCallSite>();
 			var reflection_sites = new List<ReflectionTarget>();
 			var resolved_methods = new Dictionary<IMethod, MethodDef?>();
+			var safety_notes = new List<GraphDiagnostic>();
 			int skipped = 0;
 			foreach (var method in methods) {
 				cancellation_token.ThrowIfCancellationRequested();
 				try {
 					if (!method.HasBody || method.Body?.Instructions is null)
 						continue;
+					if (method.Body.Instructions.Count > 200000) { skipped++; safety_notes.Add(new GraphDiagnostic(method, 0, GraphDiagnosticKind.AnalysisBudget, "method instruction limit reached")); continue; }
+					if (ReachableCallAnalysis.NeedsFlow(method)) continue;
+					if (IlStackValidation.Check(method, cancellation_token) is string failure) { skipped++; safety_notes.Add(new GraphDiagnostic(method, 0, failure.StartsWith("invalid IL", StringComparison.Ordinal) ? GraphDiagnosticKind.InvalidIl : GraphDiagnosticKind.AnalysisBudget, failure)); continue; }
+					var reached = IlReachability.Find(method, cancellation_token);
 					foreach (var instruction in method.Body.Instructions) {
+						if (reached is not null && !reached.Contains(instruction.Offset)) continue;
 						if (!IsDirectCallInstruction(instruction.OpCode.Code) || instruction.Operand is not IMethod reference)
 							continue;
 						var target = Resolve(reference, resolved_methods);
@@ -262,14 +300,14 @@ namespace dnSpy.CallGraph.Core {
 						if (instruction.OpCode.Code == Code.Callvirt && IsPolymorphic(target))
 							virtual_sites.Add(new VirtualCallSite(method, target, instruction.Offset, "possible callvirt target"));
 					}
-					AdvancedCallAnalysis.Scan(method, resolved_methods, call_sites, virtual_sites,
-						reflection_sites, cancellation_token);
 				}
 				catch (OperationCanceledException) { throw; }
-				catch (Exception) { skipped++; }
+				catch (Exception error) { skipped++; safety_notes.Add(new GraphDiagnostic(method, 0, GraphDiagnosticKind.InvalidIl, "IL scan failed: " + error.GetType().Name)); }
 			}
-			return Create(module, new HashSet<ModuleDef> { module }, new HashSet<MethodDef>(methods),
-				call_sites, virtual_sites, reflection_sites, skipped);
+			var analysis = new ReachableCallAnalysis(new[] { module }, cancellation_token);
+			skipped += analysis.ScanIndex(methods, call_sites, virtual_sites, reflection_sites);
+			var index = Create(module, new HashSet<ModuleDef> { module }, new HashSet<MethodDef>(methods), call_sites, virtual_sites, reflection_sites, skipped);
+			index.diagnostics = safety_notes.Concat(analysis.Diagnostics).ToArray(); return index;
 		}
 
 		public static CallGraphIndex Combine(IEnumerable<CallGraphIndex> module_indexes) {
@@ -292,8 +330,9 @@ namespace dnSpy.CallGraph.Core {
 			}
 			WorkspaceCallResolver.AddExtendedEdges(methods, indexes.SelectMany(index => index.virtual_call_sites),
 				indexes.SelectMany(index => index.reflection_targets), call_sites);
-			return Create(indexes.Length == 1 ? indexes[0].Module : null, modules, methods, call_sites,
+			var combined = Create(indexes.Length == 1 ? indexes[0].Module : null, modules, methods, call_sites,
 				Array.Empty<VirtualCallSite>(), Array.Empty<ReflectionTarget>(), indexes.Sum(index => index.SkippedMethodCount));
+			combined.diagnostics = indexes.SelectMany(index => index.diagnostics).ToArray(); return combined;
 		}
 
 		static CallGraphIndex Create(ModuleDef? module, HashSet<ModuleDef> modules, HashSet<MethodDef> methods,
@@ -377,6 +416,8 @@ namespace dnSpy.CallGraph.Core {
 		}
 
 		public bool Contains(MethodDef method) => module_methods.Contains(method);
+		public IReadOnlyList<uint> UnresolvedCalliSites(MethodDef method) =>
+			unresolved_calli.TryGetValue(method, out var offsets) ? offsets : Array.Empty<uint>();
 		public bool ContainsModule(ModuleDef module) => modules.Contains(module);
 		public IReadOnlyList<CallGraphLink> Outgoing(MethodDef method) =>
 			outgoing.TryGetValue(method, out var links) ? links : Array.Empty<CallGraphLink>();
@@ -384,16 +425,19 @@ namespace dnSpy.CallGraph.Core {
 			incoming.TryGetValue(method, out var links) ? links : Array.Empty<CallGraphLink>();
 
 		public CallGraphSlice Select(MethodDef root, CallGraphDirection direction, int depth, int maximum_nodes,
-			CallGraphFilterOptions? filter_options = null) {
-			depth = Math.Max(1, Math.Min(8, depth));
+			CallGraphFilterOptions? filter_options = null, CancellationToken cancellation_token = default) {
+			cancellation_token.ThrowIfCancellationRequested();
+			if (direction == CallGraphDirection.Callees)
+				return new ReachableCallAnalysis(modules, cancellation_token).Select(root, depth, maximum_nodes, filter_options ?? CallGraphFilterOptions.None);
 			maximum_nodes = Math.Max(2, maximum_nodes);
+			depth = Math.Max(1, Math.Min(depth, maximum_nodes - 1));
 			var filter = filter_options ?? CallGraphFilterOptions.None;
-			var layers = new Dictionary<MethodDef, int> { [root] = 0 };
-			bool truncated = false;
-			if (direction != CallGraphDirection.Callers)
-				Traverse(root, depth, maximum_nodes, 1, outgoing, link => link.Target, filter, layers, ref truncated);
+			var forward = direction == CallGraphDirection.Both
+				? new ReachableCallAnalysis(modules, cancellation_token).Select(root, depth, maximum_nodes, filter) : null;
+			var layers = forward is null ? new Dictionary<MethodDef, int> { [root] = 0 } : forward.Nodes.ToDictionary(node => node.Method, node => node.Layer);
+			bool truncated = forward?.IsTruncated == true;
 			if (direction != CallGraphDirection.Callees)
-				Traverse(root, depth, maximum_nodes, -1, incoming, link => link.Source, filter, layers, ref truncated);
+				Traverse(root, depth, maximum_nodes, -1, incoming, link => link.Source, filter, layers, ref truncated, cancellation_token);
 			var visible = new HashSet<MethodDef>(layers.Keys);
 			var nodes = layers.Select(pair => new CallGraphNode(pair.Key, pair.Value, pair.Key == root,
 				!module_methods.Contains(pair.Key)))
@@ -402,21 +446,25 @@ namespace dnSpy.CallGraph.Core {
 				.ToArray();
 			var links = visible.SelectMany(method => outgoing.TryGetValue(method, out var method_links)
 					? method_links : Array.Empty<CallGraphLink>())
-				.Where(link => visible.Contains(link.Target) && link.CallSiteCount >= filter.MinimumCallSiteCount)
+				.Where(link => visible.Contains(link.Target) && link.CallSiteCount >= filter.MinimumCallSiteCount && (forward is null || layers[link.Source] < 0))
+				.Concat(forward?.Links ?? Array.Empty<CallGraphLink>())
 				.OrderBy(link => layers[link.Source])
 				.ThenBy(link => DisplayName(link.Source), StringComparer.OrdinalIgnoreCase)
 				.ThenBy(link => DisplayName(link.Target), StringComparer.OrdinalIgnoreCase)
 				.ToArray();
-			return new CallGraphSlice(nodes, links, truncated);
+			return new CallGraphSlice(nodes, links, truncated, (forward?.UnresolvedIndirectCallCount ?? 0) +
+				layers.Where(pair => forward is null || pair.Value < 0).Sum(pair => UnresolvedCalliSites(pair.Key).Count),
+				(forward?.Diagnostics ?? Array.Empty<GraphDiagnostic>()).Concat(diagnostics.Where(item => visible.Contains(item.Method) && (forward is null || layers[item.Method] < 0))).ToArray());
 		}
 
 		static void Traverse(MethodDef root, int maximum_depth, int maximum_nodes, int layer_sign,
 			Dictionary<MethodDef, CallGraphLink[]> adjacency, Func<CallGraphLink, MethodDef> select_target,
-			CallGraphFilterOptions filter, Dictionary<MethodDef, int> layers, ref bool truncated) {
+			CallGraphFilterOptions filter, Dictionary<MethodDef, int> layers, ref bool truncated, CancellationToken cancellation_token) {
 			var visited = new HashSet<MethodDef> { root };
 			var queue = new Queue<(MethodDef Method, int Depth)>();
 			queue.Enqueue((root, 0));
 			while (queue.Count != 0) {
+				cancellation_token.ThrowIfCancellationRequested();
 				var current = queue.Dequeue();
 				if (current.Depth >= maximum_depth || !adjacency.TryGetValue(current.Method, out var links))
 					continue;
@@ -455,30 +503,99 @@ namespace dnSpy.CallGraph.Core {
 	}
 
 	sealed class CallGraphIndexCache {
+		readonly object sync = new object();
 		readonly Dictionary<ModuleDef, CallGraphIndex> entries = new Dictionary<ModuleDef, CallGraphIndex>();
+		CallGraphIndex[] combined_sources = Array.Empty<CallGraphIndex>();
+		CallGraphIndex? combined_index;
 
-		public int Count => entries.Count;
-		public bool TryGetValue(ModuleDef module, out CallGraphIndex index) => entries.TryGetValue(module, out index!);
+		public int Count {
+			get { lock (sync) return entries.Count; }
+		}
+
+		public bool TryGetValue(ModuleDef module, out CallGraphIndex index) {
+			lock (sync)
+				return entries.TryGetValue(module, out index!);
+		}
+
 		public void Store(CallGraphIndex index) {
 			if (index.Module is not ModuleDef module)
 				throw new ArgumentException("Only single-module indexes can be cached.", nameof(index));
-			entries[module] = index;
+			lock (sync) {
+				entries[module] = index;
+				ResetCombined();
+			}
 		}
-		public bool Invalidate(ModuleDef module) => entries.Remove(module);
+
+		public bool TryGetCombined(IReadOnlyList<CallGraphIndex> sources, out CallGraphIndex index) {
+			lock (sync) {
+				if (combined_index is not null && combined_sources.Length == sources.Count) {
+					bool matches = true;
+					for (int i = 0; i < combined_sources.Length; i++) {
+						if (ReferenceEquals(combined_sources[i], sources[i]))
+							continue;
+						matches = false;
+						break;
+					}
+					if (matches) {
+						index = combined_index;
+						return true;
+					}
+				}
+				index = null!;
+				return false;
+			}
+		}
+
+		public void StoreCombined(IReadOnlyList<CallGraphIndex> sources, CallGraphIndex index) {
+			lock (sync) {
+				combined_sources = sources.ToArray();
+				combined_index = index;
+			}
+		}
+
+		public bool Invalidate(ModuleDef module) {
+			lock (sync) {
+				bool removed = entries.Remove(module);
+				if (removed)
+					ResetCombined();
+				return removed;
+			}
+		}
+
 		public int Invalidate(IEnumerable<ModuleDef> modules) {
-			int count = 0;
-			foreach (var module in modules.Distinct())
-				if (entries.Remove(module))
-					count++;
-			return count;
+			lock (sync) {
+				int count = 0;
+				foreach (var module in modules.Distinct())
+					if (entries.Remove(module))
+						count++;
+				if (count != 0)
+					ResetCombined();
+				return count;
+			}
 		}
+
 		public int RemoveMissing(ISet<ModuleDef> loaded_modules) {
-			int count = 0;
-			foreach (var module in entries.Keys.Where(module => !loaded_modules.Contains(module)).ToArray())
-				if (entries.Remove(module))
-					count++;
-			return count;
+			lock (sync) {
+				int count = 0;
+				foreach (var module in entries.Keys.Where(module => !loaded_modules.Contains(module)).ToArray())
+					if (entries.Remove(module))
+						count++;
+				if (count != 0)
+					ResetCombined();
+				return count;
+			}
 		}
-		public void Clear() => entries.Clear();
+
+		public void Clear() {
+			lock (sync) {
+				entries.Clear();
+				ResetCombined();
+			}
+		}
+
+		void ResetCombined() {
+			combined_sources = Array.Empty<CallGraphIndex>();
+			combined_index = null;
+		}
 	}
 }

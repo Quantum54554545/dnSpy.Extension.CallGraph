@@ -63,8 +63,7 @@
             </StackPanel>
         </Border>
 
-		<Border x:Name="GraphHostBorder" Grid.Row="1" BorderBrush="{DynamicResource CommonControlsTextBoxBorder}" BorderThickness="0,0,0,1"
-                ToolTip="Drag to pan • Mouse wheel to zoom • Double-click a method to explore it">
+		<Border x:Name="GraphHostBorder" Grid.Row="1" BorderBrush="{DynamicResource CommonControlsTextBoxBorder}" BorderThickness="0,0,0,1">
             <Grid>
                 <controls:CallGraphSurface x:Name="GraphSurface" />
                 <controls:FunctionMapSurface x:Name="FunctionMapSurface" Visibility="Collapsed" />

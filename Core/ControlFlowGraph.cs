@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
 using dnSpy.Contracts.Text;
@@ -47,7 +48,7 @@ namespace dnSpy.CallGraph.Core {
 			};
 		}
 
-		static HighlightedSnippet BuildSnippet(IReadOnlyList<Instruction> instructions) {
+		internal static HighlightedSnippet BuildSnippet(IReadOnlyList<Instruction> instructions) {
 			var builder = new SnippetBuilder();
 			for (int i = 0; i < instructions.Count; i++) {
 				var instruction = instructions[i];
@@ -124,6 +125,16 @@ namespace dnSpy.CallGraph.Core {
 	}
 
 	sealed class ControlFlowGraph {
+		public static HighlightedSnippet MethodPreview(MethodDef method, int maximum_lines) {
+			if (!method.HasBody || method.Body.Instructions.Count == 0) return HighlightedSnippet.Plain(UiText.NoMethodBody);
+			int limit = maximum_lines > 0 ? Math.Min(maximum_lines, 80) : 80;
+			var snippet = ControlFlowBlock.BuildSnippet(method.Body.Instructions.Take(limit).ToArray());
+			string heading = UiText.PreviewIlFallback + Environment.NewLine;
+			return new HighlightedSnippet(heading + snippet.Text,
+				new[] { new ColoredTextSpan(0, heading.Length, TextColor.Comment) }
+				.Concat(snippet.Spans.Select(span => new ColoredTextSpan(heading.Length + span.Start, span.Length, span.Color, span.Reference))).ToArray());
+		}
+
 		public MethodDef Method { get; }
 		public IReadOnlyList<ControlFlowBlock> Blocks { get; }
 		public IReadOnlyList<ControlFlowGraphEdge> Edges { get; }
@@ -137,17 +148,21 @@ namespace dnSpy.CallGraph.Core {
 			IsTruncated = is_truncated;
 		}
 
-		public static ControlFlowGraph Build(MethodDef method, int maximum_blocks = 250) {
+		public static ControlFlowGraph Build(MethodDef method, int maximum_blocks = 250, CancellationToken cancellation_token = default) {
+			cancellation_token.ThrowIfCancellationRequested();
 			if (!method.HasBody || method.Body.Instructions.Count == 0)
 				return new ControlFlowGraph(method, Array.Empty<ControlFlowBlock>(), Array.Empty<ControlFlowGraphEdge>(), false);
 			maximum_blocks = Math.Max(20, Math.Min(500, maximum_blocks));
+			if (method.Body.Instructions.Count > 200000) throw new InvalidOperationException(UiText.Pick("Method exceeds the CFG instruction safety limit.", "Метод превышает защитный лимит IL-инструкций для CFG."));
 
 			var instructions = method.Body.Instructions.ToArray();
 			var instruction_indices = instructions.Select((instruction, index) => (instruction, index))
 				.ToDictionary(pair => pair.instruction, pair => pair.index);
 			var leaders = new HashSet<Instruction> { instructions[0] };
 			for (int i = 0; i < instructions.Length; i++) {
+				if ((i & 1023) == 0) cancellation_token.ThrowIfCancellationRequested();
 				var instruction = instructions[i];
+				if (instruction.Operand is Instruction destination && !instruction_indices.ContainsKey(destination) || instruction.Operand is IList<Instruction> destinations && destinations.Any(destination => !instruction_indices.ContainsKey(destination))) throw new InvalidOperationException(UiText.Pick("Invalid IL branch target.", "Некорректная цель перехода IL."));
 				AddTargets(instruction.Operand, leaders, instruction_indices);
 				var flow = instruction.OpCode.FlowControl;
 				if (i + 1 < instructions.Length && (flow == FlowControl.Branch || flow == FlowControl.Cond_Branch ||
@@ -167,6 +182,7 @@ namespace dnSpy.CallGraph.Core {
 			var blocks = new List<ControlFlowBlock>(leader_indices.Length);
 			var block_by_instruction = new Dictionary<Instruction, ControlFlowBlock>();
 			for (int i = 0; i < leader_indices.Length; i++) {
+				if ((i & 127) == 0) cancellation_token.ThrowIfCancellationRequested();
 				int start = leader_indices[i];
 				int end = i + 1 < leader_indices.Length ? leader_indices[i + 1] : instructions.Length;
 				var block_instructions = instructions.Skip(start).Take(end - start).ToArray();
@@ -189,20 +205,20 @@ namespace dnSpy.CallGraph.Core {
 				var next = block.Index + 1 < blocks.Count ? blocks[block.Index + 1] : null;
 				if (last.OpCode.Code == Code.Switch && last.Operand is IList<Instruction> switch_targets) {
 					for (int i = 0; i < switch_targets.Count; i++)
-						AddEdge(block, block_by_instruction[switch_targets[i]], ControlFlowEdgeKind.Switch,
+						AddEdge(block, block_by_instruction.TryGetValue(switch_targets[i], out var switch_block) ? switch_block : null, ControlFlowEdgeKind.Switch,
 							UiText.Pick("case ", "вариант ") + i.ToString(CultureInfo.InvariantCulture));
 					AddEdge(block, next, ControlFlowEdgeKind.FallThrough, UiText.Pick("default", "иначе"));
 					continue;
 				}
 				if (last.OpCode.FlowControl == FlowControl.Cond_Branch) {
 					if (last.Operand is Instruction conditional_target)
-						AddEdge(block, block_by_instruction[conditional_target], ControlFlowEdgeKind.Conditional, UiText.Pick("branch", "переход"));
+						AddEdge(block, block_by_instruction.TryGetValue(conditional_target, out var conditional_block) ? conditional_block : null, ControlFlowEdgeKind.Conditional, UiText.Pick("branch", "переход"));
 					AddEdge(block, next, ControlFlowEdgeKind.FallThrough, UiText.Pick("next", "далее"));
 					continue;
 				}
 				if (last.OpCode.FlowControl == FlowControl.Branch) {
 					if (last.Operand is Instruction branch_target)
-						AddEdge(block, block_by_instruction[branch_target], ControlFlowEdgeKind.Unconditional, string.Empty);
+						AddEdge(block, block_by_instruction.TryGetValue(branch_target, out var branch_block) ? branch_block : null, ControlFlowEdgeKind.Unconditional, string.Empty);
 					continue;
 				}
 				if (last.OpCode.FlowControl == FlowControl.Return || last.OpCode.FlowControl == FlowControl.Throw ||

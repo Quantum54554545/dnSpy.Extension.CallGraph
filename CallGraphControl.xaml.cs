@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -9,6 +10,7 @@ using System.Windows.Input;
 using System.Windows.Threading;
 using dnlib.DotNet;
 using dnSpy.CallGraph.Core;
+using dnSpy.CallGraph.Controls;
 using dnSpy.Contracts.Decompiler;
 using dnSpy.Contracts.Documents;
 using dnSpy.Contracts.Documents.Tabs;
@@ -25,13 +27,14 @@ namespace dnSpy.CallGraph {
 		readonly IDecompilerService decompiler_service;
 		readonly CallGraphSettings settings;
 		readonly IThemeService theme_service;
-		readonly CallGraphIndexCache index_cache = new CallGraphIndexCache();
+		readonly CallGraphIndexCache index_cache;
 		readonly Dictionary<SnippetCacheKey, HighlightedSnippet> snippet_cache = new Dictionary<SnippetCacheKey, HighlightedSnippet>();
 		readonly List<MethodDef> history = new List<MethodDef>();
 		readonly List<MethodDef> visible_methods = new List<MethodDef>();
 		readonly List<MethodDef> search_matches = new List<MethodDef>();
 		readonly DispatcherTimer document_change_timer;
 		CancellationTokenSource? operation_cancellation;
+		CancellationTokenSource? preview_cancellation;
 		MethodDef? current_root;
 		CallGraphIndex? current_index;
 		bool current_index_covers_all_loaded_modules;
@@ -43,6 +46,13 @@ namespace dnSpy.CallGraph {
 		int cfg_block_limit = 250;
 		int search_position = -1;
 		bool disposed;
+		bool visible_snippets_enabled;
+		bool visible_snippets_running;
+		bool visible_snippets_requested;
+		bool analyzing_graph;
+		bool workspace_update_pending;
+		HashSet<ModuleDef>? graph_modules;
+		int current_preview_lines = 80;
 
 		readonly struct SnippetCacheKey : IEquatable<SnippetCacheKey> {
 			public readonly MethodDef Definition;
@@ -64,14 +74,16 @@ namespace dnSpy.CallGraph {
 		GraphViewMode CurrentViewMode => (GraphViewMode)Math.Max(0, ViewModeComboBox.SelectedIndex);
 
 		internal CallGraphControl(IDocumentTabService document_tab_service, IDecompilerService decompiler_service,
-			CallGraphSettings settings, IThemeService theme_service) {
+			CallGraphSettings settings, IThemeService theme_service, CallGraphIndexCache index_cache) {
 			this.document_tab_service = document_tab_service;
 			this.decompiler_service = decompiler_service;
 			this.settings = settings;
 			this.theme_service = theme_service;
+			this.index_cache = index_cache;
 			InitializeComponent();
 			ApplyLocalizedText();
 			GraphSurface.SetThemeService(theme_service);
+			FunctionMapSurface.SetThemeService(theme_service);
 			GraphSurface.Configure(settings);
 			InitializeToolbar();
 			document_change_timer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) {
@@ -99,9 +111,9 @@ namespace dnSpy.CallGraph {
 			CenterButton.ToolTip = UiText.CenterRootTip;
 			ViewModeComboBox.ToolTip = UiText.ViewModeTip;
 			DirectionComboBox.ToolTip = UiText.DirectionTip;
+			DepthComboBox.ToolTip = UiText.DepthTip;
 			NodeLimitComboBox.ToolTip = UiText.NodeLimitTip;
 			LanguageComboBox.ToolTip = UiText.LanguageTip;
-			GraphHostBorder.ToolTip = UiText.GraphGestureTip;
 			SearchLabel.Text = UiText.Search;
 			SearchTextBox.ToolTip = UiText.SearchMethodTip;
 			SearchPreviousButton.ToolTip = UiText.PreviousMatch;
@@ -157,6 +169,11 @@ namespace dnSpy.CallGraph {
 				foreach (var key in snippet_cache.Keys.Where(key => key.Definition.Module is not ModuleDef module || !loaded_modules.Contains(module)).ToArray())
 					snippet_cache.Remove(key);
 			}
+			if ((analyzing_graph || visible_snippets_running) && graph_modules is not null &&
+				graph_modules.IsSubsetOf(loaded_modules) && current_root?.Module is ModuleDef current_module && loaded_modules.Contains(current_module)) {
+				workspace_update_pending = true;
+				return;
+			}
 			current_index = null;
 			current_index_covers_all_loaded_modules = false;
 			operation_cancellation?.Cancel();
@@ -183,7 +200,7 @@ namespace dnSpy.CallGraph {
 			ViewModeComboBox.SelectedIndex = 0;
 			DirectionComboBox.ItemsSource = new[] { UiText.Callees, UiText.Callers, UiText.Both };
 			DirectionComboBox.SelectedIndex = 0;
-			DepthComboBox.ItemsSource = Enumerable.Range(1, 8).ToArray();
+			DepthComboBox.ItemsSource = Enumerable.Range(1, 8).Cast<object>().Concat(new object[] { UiText.MaximumDepth }).ToArray();
 			DepthComboBox.SelectedItem = 2;
 			LanguageComboBox.ItemsSource = new[] { "C#", "IL" };
 			LanguageComboBox.SelectedIndex = 0;
@@ -207,9 +224,11 @@ namespace dnSpy.CallGraph {
 			GraphSurface.NavigateRequested += (_, e) => document_tab_service.FollowReference(e.Reference, newTab: true);
 			GraphSurface.RootRequested += (_, e) => { if (ResolveMethod(e.Reference) is MethodDef method) ShowMethod(method); };
 			GraphSurface.SelectionChanged += (_, e) => StatusText.Text = FormatReferenceStatus(e.Reference);
+			GraphSurface.VisibleMethodsChanged += (_, __) => RequestVisibleSnippets();
 			FunctionMapSurface.NavigateRequested += (_, e) => document_tab_service.FollowReference(e.Reference, newTab: true);
 			FunctionMapSurface.RootRequested += (_, e) => { if (e.Reference is MethodDef method) ShowMethod(method); };
 			FunctionMapSurface.SelectionChanged += (_, e) => StatusText.Text = FormatReferenceStatus(e.Reference);
+			FunctionMapSurface.CodePreviewRequested += (_, e) => RequestFunctionMapPreview(e.Reference as MethodDef);
 			UpdateModeControls();
 		}
 
@@ -288,7 +307,7 @@ namespace dnSpy.CallGraph {
 			DirectionComboBox.IsEnabled = !is_cfg;
 			DepthComboBox.IsEnabled = !is_cfg;
 			NodeLimitComboBox.IsEnabled = true;
-			LanguageComboBox.IsEnabled = mode == GraphViewMode.CallBlocks;
+			LanguageComboBox.IsEnabled = !is_cfg;
 			SearchTextBox.IsEnabled = !is_cfg;
 			if (is_cfg)
 				SearchTextBox.ToolTip = UiText.SearchUnavailableInCfg;
@@ -309,7 +328,7 @@ namespace dnSpy.CallGraph {
 				NodeLimitComboBox.SelectedItem = cfg_block_limit;
 			}
 			else {
-				NodeLimitComboBox.ItemsSource = new[] { 20, 40, 80, 120 };
+				NodeLimitComboBox.ItemsSource = new[] { 20, 40, 80, 120, 250, 500 };
 				NodeLimitComboBox.SelectedItem = call_block_limit;
 			}
 		}
@@ -357,6 +376,7 @@ namespace dnSpy.CallGraph {
 		}
 
 		internal void ShowNoSelectionMessage() {
+			analyzing_graph = false; workspace_update_pending = false; graph_modules = null;
 			GraphSurface.Clear(UiText.NoSelection);
 			FunctionMapSurface.Clear();
 			StatusText.Text = UiText.NoSelectionStatus;
@@ -381,6 +401,8 @@ namespace dnSpy.CallGraph {
 			if (disposed || current_root is null)
 				return;
 			operation_cancellation?.Cancel();
+			visible_snippets_enabled = false;
+			preview_cancellation?.Cancel();
 			operation_cancellation?.Dispose();
 			operation_cancellation = new CancellationTokenSource();
 			_ = RenderCurrentAsync(operation_cancellation.Token);
@@ -391,44 +413,64 @@ namespace dnSpy.CallGraph {
 			if (root?.Module is null)
 				return;
 			var mode = CurrentViewMode;
+			analyzing_graph = true;
 			try {
 				if (mode == GraphViewMode.ControlFlow) {
 					SetVisibleMethods(Array.Empty<MethodDef>());
 					SetBusy(true, UiText.BuildingCfg);
 					int block_limit = NodeLimitComboBox.SelectedItem is int selected_limit ? selected_limit : cfg_block_limit;
-					var cfg = await Task.Run(() => ControlFlowGraph.Build(root, block_limit), cancellation_token);
+					var cfg = await Task.Run(() => ControlFlowGraph.Build(root, block_limit, cancellation_token), cancellation_token);
 					cancellation_token.ThrowIfCancellationRequested();
 					GraphSurface.Render(cfg, settings.EffectiveMaximumLines);
+					if (cfg.Blocks.Count == 0) { StatusText.Text = UiText.NoMethodBody; return; }
 					StatusText.Text = UiText.CfgStatus(CallGraphIndex.Signature(root), cfg.Blocks.Count, cfg.Edges.Count,
 						cfg.IsTruncated ? block_limit : null);
 					return;
 				}
 
 				var direction = (CallGraphDirection)Math.Max(0, DirectionComboBox.SelectedIndex);
-				int depth = DepthComboBox.SelectedItem is int depth_value ? depth_value : 2;
+				int depth = DepthComboBox.SelectedItem is int depth_value ? depth_value : int.MaxValue;
 				int node_limit = NodeLimitComboBox.SelectedItem is int node_limit_value ? node_limit_value : 40;
 				var filters = settings.CreateFilterOptions();
 				var modules = GetLoadedModules();
 				if (!modules.Contains(root.Module))
 					modules.Insert(0, root.Module);
+				graph_modules = new HashSet<ModuleDef>(modules);
 				var index = current_index;
-				if (index is null || !current_index_covers_all_loaded_modules || !index.ContainsModule(root.Module)) {
-					var module_indexes = await GetOrBuildModuleIndexesAsync(modules, cancellation_token);
-					index = await Task.Run(() => CallGraphIndex.Combine(module_indexes), cancellation_token);
+				CallGraphSlice slice;
+				if (direction == CallGraphDirection.Callees) {
+					SetBusy(true, UiText.AnalyzingReachable);
+					var progress = new Progress<CallGraphSlice>(preview => {
+						if (disposed || cancellation_token.IsCancellationRequested || !analyzing_graph || !ReferenceEquals(root, current_root) || mode != CurrentViewMode) return;
+						if (mode == GraphViewMode.FunctionMap) FunctionMapSurface.Render(preview);
+						else GraphSurface.Render(preview, preview.Nodes.ToDictionary(node => node.Method, _ => HighlightedSnippet.Plain(UiText.AnalyzingReachable)));
+					});
+					var reachable = await Task.Run(() => CallGraphIndex.BuildReachableProgressive(root, modules, depth, node_limit, filters, progress, cancellation_token), cancellation_token);
 					cancellation_token.ThrowIfCancellationRequested();
+					index = reachable.Index; slice = reachable.Slice;
 					current_index = index;
-					current_index_covers_all_loaded_modules = true;
+					current_index_covers_all_loaded_modules = false;
 				}
-				if (index is null)
-					return;
-				var slice = await Task.Run(() => index.Select(root, direction, depth, node_limit, filters), cancellation_token);
+				else {
+					if (index is null || index.IsReachableIndex || !current_index_covers_all_loaded_modules || !index.ContainsModule(root.Module)) {
+						var module_indexes = await GetOrBuildModuleIndexesAsync(modules, cancellation_token);
+						if (!index_cache.TryGetCombined(module_indexes, out index)) {
+							index = await Task.Run(() => CallGraphIndex.Combine(module_indexes), cancellation_token);
+							index_cache.StoreCombined(module_indexes, index);
+						}
+						cancellation_token.ThrowIfCancellationRequested();
+						current_index = index;
+						current_index_covers_all_loaded_modules = true;
+					}
+					if (index is null) return;
+					slice = await Task.Run(() => index.Select(root, direction, depth, node_limit, filters, cancellation_token), cancellation_token);
+				}
 				cancellation_token.ThrowIfCancellationRequested();
-
+				StatusText.ToolTip = AnalysisDetails.StatusToolTip(slice);
 				if (mode == GraphViewMode.FunctionMap) {
 					FunctionMapSurface.Render(slice, index);
 					SetVisibleMethods(slice.Nodes.Select(node => node.Method));
-					StatusText.Text = UiText.IndexedGraphStatus(UiText.FunctionMap + ": " + CallGraphIndex.DisplayName(root),
-						slice.Nodes.Count, slice.Links.Count, index.ModuleCount, index.MethodCount, index.LinkCount, slice.IsTruncated);
+					StatusText.Text = FormatGraphStatus(UiText.FunctionMap + ": " + CallGraphIndex.DisplayName(root), index, slice);
 					return;
 				}
 
@@ -439,19 +481,13 @@ namespace dnSpy.CallGraph {
 					return;
 				}
 
-				var snippets = BuildSnippetPreview(slice, decompiler.GenericGuid, out bool preview_complete);
-				if (!preview_complete) {
-					GraphSurface.Render(slice, snippets);
-					SetVisibleMethods(slice.Nodes.Select(node => node.Method));
-					SetBusy(true, UiText.Decompiling);
-					await Dispatcher.Yield(DispatcherPriority.Background);
-					snippets = await Task.Run(() => BuildSnippets(slice, decompiler, cancellation_token), cancellation_token);
-					cancellation_token.ThrowIfCancellationRequested();
-				}
+				current_preview_lines = settings.GetMaximumLines(slice.Nodes.Count);
+				var snippets = BuildSnippetPreview(slice, decompiler.GenericGuid, out _);
 				GraphSurface.Render(slice, snippets);
+				visible_snippets_enabled = true;
 				SetVisibleMethods(slice.Nodes.Select(node => node.Method));
-				StatusText.Text = UiText.IndexedGraphStatus(CallGraphIndex.DisplayName(root), slice.Nodes.Count,
-					slice.Links.Count, index.ModuleCount, index.MethodCount, index.LinkCount, slice.IsTruncated);
+				StatusText.Text = FormatGraphStatus(CallGraphIndex.DisplayName(root), index, slice);
+				RequestVisibleSnippets();
 			}
 			catch (OperationCanceledException) { }
 			catch (Exception ex) {
@@ -462,41 +498,82 @@ namespace dnSpy.CallGraph {
 				StatusText.Text = UiText.GraphError(ex.Message);
 			}
 			finally {
-				if (!cancellation_token.IsCancellationRequested)
+				if (!cancellation_token.IsCancellationRequested) {
+					analyzing_graph = false;
 					SetBusy(false, null);
+					FlushWorkspaceUpdate();
+				}
 			}
 		}
 
-		Dictionary<MethodDef, HighlightedSnippet> BuildSnippets(CallGraphSlice slice, IDecompiler decompiler,
-			CancellationToken cancellation_token) {
-			var result = new Dictionary<MethodDef, HighlightedSnippet>();
-			foreach (var node in slice.Nodes.OrderByDescending(node => node.IsRoot)) {
-				cancellation_token.ThrowIfCancellationRequested();
-				int maximum_lines = settings.EffectiveMaximumLines;
-				var key = new SnippetCacheKey(node.Method, decompiler.GenericGuid, maximum_lines);
-				HighlightedSnippet? text;
-				lock (snippet_cache)
-					snippet_cache.TryGetValue(key, out text);
-				if (text is null) {
-					text = Decompile(node.Method, decompiler, maximum_lines, cancellation_token);
+		void FlushWorkspaceUpdate() {
+			if (!workspace_update_pending || analyzing_graph || visible_snippets_running || disposed) return;
+			workspace_update_pending = false;
+			current_index = null; current_index_covers_all_loaded_modules = false;
+			document_change_timer.Stop(); document_change_timer.Start();
+		}
+
+		static string FormatGraphStatus(string title, CallGraphIndex index, CallGraphSlice slice) =>
+			(index.IsReachableIndex ? UiText.ReachableGraphStatus(title, slice.Nodes.Count, slice.Links.Count, slice.IsTruncated) :
+			UiText.IndexedGraphStatus(title, slice.Nodes.Count, slice.Links.Count, index.ModuleCount, index.MethodCount, index.LinkCount, slice.IsTruncated)) +
+			UiText.UnresolvedCalls(slice.UnresolvedIndirectCallCount >= 0 ? slice.UnresolvedIndirectCallCount : slice.Nodes.Sum(node => index.UnresolvedCalliSites(node.Method).Count)) + AnalysisDetails.Status(slice);
+
+		async void RequestVisibleSnippets() {
+			if (disposed || !visible_snippets_enabled || CurrentViewMode != GraphViewMode.CallBlocks) return;
+			visible_snippets_requested = true;
+			if (visible_snippets_running) return;
+			visible_snippets_running = true;
+			var token = operation_cancellation?.Token ?? CancellationToken.None;
+			try {
+				var decompiler = FindDecompiler(LanguageComboBox.SelectedIndex == 1 ? DecompilerConstants.LANGUAGE_IL : DecompilerConstants.LANGUAGE_CSHARP);
+				if (decompiler is null) return;
+				int maximum_lines = current_preview_lines;
+				var decompilation_context = new DecompilationContext { AsyncMethodBodyDecompilation = false };
+				while (visible_snippets_enabled && CurrentViewMode == GraphViewMode.CallBlocks) {
+					token.ThrowIfCancellationRequested();
+					visible_snippets_requested = false;
+					var visible = GraphSurface.VisibleMethods();
+					MethodDef[] missing;
 					lock (snippet_cache)
-						snippet_cache[key] = text;
+						missing = visible.Where(method => !snippet_cache.ContainsKey(new SnippetCacheKey(method, decompiler.GenericGuid, maximum_lines))).Take(4).ToArray();
+					if (missing.Length == 0) break;
+					var snippets = await Task.Run(() => {
+						var result = new Dictionary<MethodDef, HighlightedSnippet>();
+						var batch_time = Stopwatch.StartNew();
+						foreach (var method in missing) {
+							token.ThrowIfCancellationRequested();
+							result[method] = DecompileWithContext(method, decompiler, maximum_lines, token, decompilation_context);
+							if (batch_time.ElapsedMilliseconds >= 60) break;
+						}
+						return result;
+					}, token);
+					token.ThrowIfCancellationRequested();
+					lock (snippet_cache)
+						foreach (var pair in snippets) snippet_cache[new SnippetCacheKey(pair.Key, decompiler.GenericGuid, maximum_lines)] = pair.Value;
+					GraphSurface.UpdateSnippets(snippets);
+					await Dispatcher.Yield(DispatcherPriority.Background);
 				}
-				result[node.Method] = text.LimitLines(maximum_lines);
 			}
-			return result;
+			catch (OperationCanceledException) { }
+			catch (Exception ex) { if (!disposed) StatusText.Text = UiText.GraphError(ex.Message); }
+			finally {
+				visible_snippets_running = false;
+				FlushWorkspaceUpdate();
+				if (visible_snippets_requested && !disposed && visible_snippets_enabled)
+					_ = Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(RequestVisibleSnippets));
+			}
 		}
 
 		Dictionary<MethodDef, HighlightedSnippet> BuildSnippetPreview(CallGraphSlice slice, Guid language,
 			out bool complete) {
 			var result = new Dictionary<MethodDef, HighlightedSnippet>();
 			complete = true;
-			int maximum_lines = settings.EffectiveMaximumLines;
+			int maximum_lines = current_preview_lines;
 			lock (snippet_cache) {
 				foreach (var node in slice.Nodes) {
 					var key = new SnippetCacheKey(node.Method, language, maximum_lines);
 					if (snippet_cache.TryGetValue(key, out var cached))
-						result[node.Method] = cached.LimitLines(settings.EffectiveMaximumLines);
+						result[node.Method] = cached.LimitLines(maximum_lines);
 					else {
 						complete = false;
 						result[node.Method] = HighlightedSnippet.Plain(UiText.LoadingCode,
@@ -508,21 +585,72 @@ namespace dnSpy.CallGraph {
 		}
 
 		static HighlightedSnippet Decompile(MethodDef method, IDecompiler decompiler, int maximum_lines,
-			CancellationToken cancellation_token) {
+			CancellationToken cancellation_token) => DecompileWithContext(method, decompiler, maximum_lines, cancellation_token,
+				new DecompilationContext { AsyncMethodBodyDecompilation = false });
+
+		static HighlightedSnippet DecompileWithContext(MethodDef method, IDecompiler decompiler, int maximum_lines,
+			CancellationToken cancellation_token, DecompilationContext context) {
 			var output = new HighlightedDecompilerOutput(maximum_lines);
+			using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellation_token);
+			timeout.CancelAfter(TimeSpan.FromMilliseconds(900));
 			try {
-				var context = new DecompilationContext { CancellationToken = cancellation_token, AsyncMethodBodyDecompilation = false };
+				context.CancellationToken = timeout.Token;
 				try {
-					lock (decompiler)
+					lock (decompiler) {
+						timeout.Token.ThrowIfCancellationRequested();
 						decompiler.Decompile(method, output, context);
+					}
 				}
 				catch (SnippetLimitReachedException) { }
 				return output.CreateSnippet();
+			}
+			catch (OperationCanceledException) when (!cancellation_token.IsCancellationRequested) {
+				return ControlFlowGraph.MethodPreview(method, maximum_lines);
 			}
 			catch (OperationCanceledException) { throw; }
 			catch (Exception ex) {
 				return HighlightedSnippet.Plain(UiText.Pick("Decompilation failed: ", "Ошибка декомпиляции: ") + ex.Message,
 					dnSpy.Contracts.Text.TextColor.Error);
+			}
+		}
+
+		async void RequestFunctionMapPreview(MethodDef? method) {
+			if (method is null || disposed || CurrentViewMode != GraphViewMode.FunctionMap)
+				return;
+			preview_cancellation?.Cancel();
+			preview_cancellation?.Dispose();
+			preview_cancellation = new CancellationTokenSource();
+			var cancellation_token = preview_cancellation.Token;
+			Guid language_guid = LanguageComboBox.SelectedIndex == 1
+				? DecompilerConstants.LANGUAGE_IL
+				: DecompilerConstants.LANGUAGE_CSHARP;
+			var decompiler = FindDecompiler(language_guid);
+			if (decompiler is null)
+				return;
+			const int preview_lines = 24;
+			var key = new SnippetCacheKey(method, decompiler.GenericGuid, preview_lines);
+			HighlightedSnippet? snippet;
+			lock (snippet_cache) {
+				snippet_cache.TryGetValue(key, out snippet);
+				if (snippet is null)
+					snippet = snippet_cache
+						.Where(pair => ReferenceEquals(pair.Key.Definition, method) && pair.Key.Language == decompiler.GenericGuid)
+						.Select(pair => pair.Value.LimitLines(preview_lines))
+						.FirstOrDefault();
+			}
+			try {
+				if (snippet is null) {
+					snippet = await Task.Run(() => Decompile(method, decompiler, preview_lines, cancellation_token), cancellation_token);
+					lock (snippet_cache)
+						snippet_cache[key] = snippet;
+				}
+				cancellation_token.ThrowIfCancellationRequested();
+				if (!disposed && CurrentViewMode == GraphViewMode.FunctionMap)
+					FunctionMapSurface.SetCodePreview(method, snippet);
+			}
+			catch (OperationCanceledException) { }
+			catch (Exception ex) {
+				if (!disposed) FunctionMapSurface.SetCodePreview(method, HighlightedSnippet.Plain(ex.Message, dnSpy.Contracts.Text.TextColor.Error));
 			}
 		}
 
@@ -540,7 +668,8 @@ namespace dnSpy.CallGraph {
 					missing.Add(module);
 			}
 			if (missing.Count != 0) {
-				int worker_count = Math.Max(1, Math.Min(4, Math.Min(Environment.ProcessorCount, missing.Count)));
+				int worker_limit = Math.Max(1, Math.Min(8, Environment.ProcessorCount - 1));
+				int worker_count = Math.Min(worker_limit, missing.Count);
 				SetBusy(true, UiText.IndexingWorkspaceParallel(missing.Count, modules.Count, worker_count));
 				using var semaphore = new SemaphoreSlim(worker_count, worker_count);
 				var tasks = missing.Select(async module => {
@@ -597,6 +726,7 @@ namespace dnSpy.CallGraph {
 			if (disposed)
 				return;
 			disposed = true;
+			graph_modules = null; workspace_update_pending = false;
 			settings.Changed -= Settings_Changed;
 			theme_service.ThemeChanged -= ThemeService_ThemeChanged;
 			document_tab_service.DocumentModified -= DocumentTabService_DocumentModified;
@@ -606,7 +736,9 @@ namespace dnSpy.CallGraph {
 			operation_cancellation?.Cancel();
 			operation_cancellation?.Dispose();
 			operation_cancellation = null;
-			index_cache.Clear();
+			preview_cancellation?.Cancel();
+			preview_cancellation?.Dispose();
+			preview_cancellation = null;
 			lock (snippet_cache)
 				snippet_cache.Clear();
 			history.Clear();

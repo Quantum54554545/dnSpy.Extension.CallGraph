@@ -15,6 +15,7 @@ namespace dnSpy.CallGraph {
 		public static string Graph => Pick("Graph", "Граф");
 		public static string Calls => Pick("Calls", "Вызовы");
 		public static string Depth => Pick("Depth", "Глубина");
+		public static string MaximumDepth => Pick("Max", "Макс");
 		public static string Limit => Pick("Limit", "Лимит");
 		public static string Code => Pick("Code", "Код");
 		public static string CenterRoot => Pick("Center root", "Корень в центр");
@@ -33,14 +34,21 @@ namespace dnSpy.CallGraph {
 		public static string Both => Pick("Both", "Оба");
 		public static string ViewModeTip => Pick("Call blocks: method code\nFunction map: fast overview\nCFG: IL basic blocks inside one method", "Блоки вызовов: код методов\nКарта функций: быстрый обзор\nCFG: базовые IL-блоки одного метода");
 		public static string DirectionTip => Pick("Callees: methods called by the root\nCallers: methods that call the root\nBoth: both directions", "Вызываемые: методы, которые вызывает корень\nВызывающие: методы, вызывающие корень\nОба: оба направления");
-		public static string NodeLimitTip => Pick("Maximum number of visible methods or CFG blocks", "Максимальное число видимых методов или CFG-блоков");
+		public static string DepthTip => Pick("Traversal depth. Max follows calls up to the node or analysis-work limit; unresolved transitions have analysis notes.", "Глубина обхода. «Макс» продолжает обход до лимита узлов или работы анализатора; неразрешённые переходы поясняются в замечаниях.");
+		public static string NodeLimitTip => Pick("Maximum number of visible methods or CFG blocks. Depth Max still stops at this limit.", "Максимальное число видимых методов или CFG-блоков. Даже при глубине «Макс» обход останавливается на этом лимите.");
 		public static string LanguageTip => Pick("Decompiler used inside graph blocks", "Декомпилятор для кода внутри блоков");
-		public static string GraphGestureTip => Pick("Drag to pan • Mouse wheel to zoom • Double-click to explore", "Перетаскивание: панорама • Колесо: масштаб • Двойной щелчок: исследовать");
+		public static string LoadingPreview => Pick("Loading code preview …", "Загрузка кода …");
+		public static string AnalyzingReachable => Pick("Analyzing reachable calls …", "Анализ достижимых вызовов …");
+		public static string ReachableGraphStatus(string root, int nodes, int links, bool limited) => Pick(
+			$"{root}   •   {nodes} methods   •   {links} links   •   call-site context analysis" + (limited ? "   •   traversal limit reached" : ""),
+			$"{root}   •   методов: {nodes}   •   связей: {links}   •   анализ аргументов вызовов" + (limited ? "   •   достигнут лимит обхода" : ""));
+		public static string PreviewIlFallback => Pick("Preview time limit reached; showing IL", "Превышено время предпросмотра; показан IL");
+		public static string UnresolvedCalls(int count) => count == 0 ? string.Empty : Pick($"   •   unresolved calli sites: {count}", $"   •   не разрешены calli: {count}");
 
 		public static string SettingsHeading => Pick("Call Graph blocks", "Блоки графа вызовов");
 		public static string LinesTitle => Pick("Lines shown in each block", "Строк в каждом блоке");
-		public static string LinesDescription => Pick("Auto keeps normal methods complete and caps very large methods at 80 lines.", "Авто показывает обычные методы целиком, а очень большие ограничивает 80 строками.");
-		public static string AutoLines => Pick("Auto (up to 80)", "Авто (до 80)");
+		public static string LinesDescription => Pick("Auto keeps normal methods complete: up to 80 lines, or 32 in graphs over 120 methods. Select a line count to override this.", "Авто показывает обычные методы целиком: до 80 строк, а в графах больше 120 методов — до 32. Конкретное число строк отменяет это ограничение.");
+		public static string AutoLines => Pick("Auto (32–80)", "Авто (32–80)");
 		public static string BlockWidth => Pick("Block width", "Ширина блока");
 		public static string BlockWidthDescription => Pick("Wider blocks reduce wrapping but use more horizontal space.", "Широкие блоки уменьшают перенос строк, но занимают больше места по горизонтали.");
 		public static string WrapLines => Pick("Wrap long code lines", "Переносить длинные строки кода");
@@ -52,6 +60,8 @@ namespace dnSpy.CallGraph {
 		public static string HideConstructors => Pick("Hide constructors", "Скрывать конструкторы");
 		public static string OnlyCurrentNamespace => Pick("Only the current namespace", "Только текущее пространство имён");
 		public static string OnlyCurrentType => Pick("Only the current type", "Только текущий тип");
+		public static string OnlyCurrentAssembly => Pick("Only the current assembly (hide methods from other DLLs)", "Только текущая сборка (скрывать методы из других DLL)");
+		public static string OnlyCurrentAssemblyDescription => Pick("Call Blocks and Function Map keep nodes from the root method's assembly. Hidden methods are not bypassed or linked directly to their callers. CFG still shows the selected method's IL instructions.", "Call Blocks и карта функций показывают узлы из сборки корневого метода. Скрытые методы не обходятся и не заменяются прямыми связями. CFG сохраняет IL-инструкции выбранного метода.");
 		public static string RequireMethodBody => Pick("Only methods with an IL body", "Только методы с IL-телом");
 		public static string MinimumCallSites => Pick("Minimum call sites per edge", "Минимум мест вызова для связи");
 		public static string KeyboardShortcut => Pick("Keyboard shortcut", "Горячая клавиша");
@@ -68,7 +78,7 @@ namespace dnSpy.CallGraph {
 		public static string CopyFullName => Pick("_Copy full name", "_Копировать полное имя");
 		public static string CopyBlockIl => Pick("_Copy block IL", "_Копировать IL блока");
 		public static string DoubleClickExplore(string name) => Pick("Double-click to explore " + name, "Двойной щелчок: исследовать " + name);
-		public static string NoMethodBody => Pick("No method body", "У метода нет тела");
+		public static string NoMethodBody => Pick("No inspectable IL body", "Нет доступного IL-тела метода");
 		public static string MoreLines(int count) => Pick($"… {count} more line{(count == 1 ? string.Empty : "s")} • open source for the complete method", $"… ещё строк: {count} • откройте исходный код для полного метода");
 		public static string MethodTruncated => Pick("… method truncated • open source for the complete method", "… метод сокращён • откройте исходный код для полного метода");
 
@@ -76,8 +86,8 @@ namespace dnSpy.CallGraph {
 		public static string MapLegendRoot => Pick("ROOT", "КОРЕНЬ");
 		public static string MapLegendCallees => Pick("CALLEES", "ВЫЗЫВАЕМЫЕ");
 		public static string MapLegendPossible => Pick("DASHED: POSSIBLE RUNTIME TARGET", "ПУНКТИР: ВОЗМОЖНАЯ RUNTIME-ЦЕЛЬ");
-		public static string MapHint => Pick("Wheel: zoom  •  Drag: pan  •  Double-click: explore  •  Right-click: actions", "Колесо: масштаб  •  Перетаскивание: панорама  •  Двойной щелчок: исследовать  •  ПКМ: действия");
-		public static string MethodsLinks(int methods, int links, bool truncated) => Pick($"{methods} methods  •  {links} links" + (truncated ? "  •  limit reached" : string.Empty), $"Методов: {methods}  •  Связей: {links}" + (truncated ? "  •  достигнут лимит" : string.Empty));
+		public static string MapHint => Pick("Drag node: move  •  Drag background: pan  •  Hover: code  •  Double-click: explore", "Узел: переместить  •  Фон: панорама  •  Наведение: код  •  Двойной щелчок: исследовать");
+		public static string MethodsLinks(int methods, int links, bool truncated) => Pick($"{methods} methods  •  {links} links" + (truncated ? "  •  traversal limited" : string.Empty), $"Методов: {methods}  •  Связей: {links}" + (truncated ? "  •  обход ограничен" : string.Empty));
 		public static string MethodInfo(int callers, int callees, int call_sites, int instructions, bool is_static) => Pick($"IL {instructions} instructions   •   {(is_static ? "static" : "instance")}\n{callers} callers   •   {callees} callees   •   {call_sites} call sites", $"IL-инструкций: {instructions}   •   {(is_static ? "статический" : "экземплярный")}\nВызывающих: {callers}   •   вызываемых: {callees}   •   мест вызова: {call_sites}");
 
 		public static string NoSelection => Pick("Select a method in Assembly Explorer or place the caret on a method in C#/IL, then click Current selection.", "Выберите метод в обозревателе сборок или поставьте курсор на метод в C#/IL, затем нажмите «Текущий метод».");
@@ -100,8 +110,8 @@ namespace dnSpy.CallGraph {
 			$"CFG: {signature}   •   {blocks} basic blocks   •   {edges} edges" + (limit is int value ? $"   •   limited to {value} blocks" : string.Empty),
 			$"CFG: {signature}   •   базовых блоков: {blocks}   •   рёбер: {edges}" + (limit is int value_ru ? $"   •   ограничено до {value_ru} блоков" : string.Empty));
 		public static string IndexedGraphStatus(string prefix, int methods, int edges, int index_modules, int index_methods, int index_links, bool truncated) => Pick(
-			$"{prefix}   •   {methods} methods   •   {edges} edges   •   workspace index {index_modules} modules / {index_methods} methods / {index_links} links" + (truncated ? "   •   node limit reached" : string.Empty),
-			$"{prefix}   •   методов: {methods}   •   рёбер: {edges}   •   общий индекс: {index_modules} модулей / {index_methods} методов / {index_links} связей" + (truncated ? "   •   достигнут лимит узлов" : string.Empty));
+			$"{prefix}   •   {methods} methods   •   {edges} edges   •   workspace index {index_modules} modules / {index_methods} methods / {index_links} links" + (truncated ? "   •   traversal limited; see analysis notes" : string.Empty),
+			$"{prefix}   •   методов: {methods}   •   рёбер: {edges}   •   общий индекс: {index_modules} модулей / {index_methods} методов / {index_links} связей" + (truncated ? "   •   обход ограничен; см. замечания анализа" : string.Empty));
 		public static string DecompilerUnavailable(string language) => Pick(language + " decompiler is not available.", "Декомпилятор " + language + " недоступен.");
 		public static string RenderFailure(string message) => Pick("Graph could not be rendered: " + message, "Не удалось отрисовать граф: " + message);
 	}

@@ -16,6 +16,57 @@ using dnSpy.Contracts.Themes;
 
 namespace dnSpy.CallGraph.Controls {
 	sealed class CallGraphSurface : UserControl {
+		sealed class EdgeLayer : FrameworkElement {
+			readonly CallGraphSurface owner;
+			DrawingGroup? drawing;
+			public EdgeLayer(CallGraphSurface owner) {
+				this.owner = owner; ToolTip = " ";
+				ToolTipOpening += (_, e) => {
+					Point point = Mouse.GetPosition(this);
+					var pen = new Pen(Brushes.Black, 7 / owner.Zoom);
+					var hit = owner.edge_visuals.FirstOrDefault(edge => edge.Curve.Data.StrokeContains(pen, point));
+					if (hit is null) e.Handled = true; else ToolTip = hit.Link.ToolTip;
+				};
+			}
+			public void InvalidateDrawing() { drawing = null; InvalidateVisual(); }
+			protected override void OnRender(DrawingContext context) {
+				if (drawing is null) { drawing = new DrawingGroup(); using (var target = drawing.Open()) owner.DrawEdges(target); }
+				context.DrawDrawing(drawing);
+			}
+		}
+		sealed class EdgeVisual {
+			public GraphLinkPresentation Link { get; }
+			public Path Curve { get; }
+			public Path Arrow { get; }
+			public FrameworkElement? Label { get; }
+			public Vector LabelOffset { get; }
+
+			public EdgeVisual(GraphLinkPresentation link, Path curve, Path arrow,
+				FrameworkElement? label, Vector label_offset) {
+				Link = link;
+				Curve = curve;
+				Arrow = arrow;
+				Label = label;
+				LabelOffset = label_offset;
+			}
+		}
+
+		readonly struct EdgePlacement {
+			public Point From { get; }
+			public Point To { get; }
+			public Point Control1 { get; }
+			public Point Control2 { get; }
+			public Point LabelPoint { get; }
+
+			public EdgePlacement(Point from, Point to, Point control1, Point control2, Point label_point) {
+				From = from;
+				To = to;
+				Control1 = control1;
+				Control2 = control2;
+				LabelPoint = label_point;
+			}
+		}
+
 		const double ColumnGap = 115;
 		const double NodeGap = 30;
 		const double CanvasMargin = 60;
@@ -23,17 +74,24 @@ namespace dnSpy.CallGraph.Controls {
 		const double MinimumVerticalPanSpace = 260;
 		const double DefaultNodeWidth = 430;
 		const double HeaderHeight = 47;
-		const double CodeVerticalMargin = 12;
 		const double MinimumNodeHeight = 78;
 
 		readonly ScrollViewer scroll_viewer;
 		readonly Border pan_host;
 		readonly Canvas canvas;
+		readonly Canvas extent_host;
 		readonly ScaleTransform scale_transform;
+		readonly EdgeLayer edge_layer;
+		readonly DispatcherTimer visibility_timer;
+		bool visibility_update_pending;
 		IThemeService? theme_service;
 		readonly Dictionary<object, Border> node_borders = new Dictionary<object, Border>();
+		readonly Dictionary<object, Border> cached_borders = new Dictionary<object, Border>();
 		readonly Dictionary<object, Rect> node_rects = new Dictionary<object, Rect>();
-		readonly List<(Run Run, TextColor Color)> colored_runs = new List<(Run, TextColor)>();
+		readonly List<EdgeVisual> edge_visuals = new List<EdgeVisual>();
+		readonly Dictionary<object, GraphNodePresentation> node_presentations = new Dictionary<object, GraphNodePresentation>();
+		readonly Dictionary<object, HighlightedSnippet> node_snippets = new Dictionary<object, HighlightedSnippet>();
+		bool updating_visibility;
 		double node_width = DefaultNodeWidth;
 		bool wrap_long_lines = true;
 		bool syntax_highlighting = true;
@@ -46,10 +104,15 @@ namespace dnSpy.CallGraph.Controls {
 		MouseButton pan_button;
 		bool is_pan_candidate;
 		bool is_panning;
+		object? dragged_node_reference;
+		Rect dragged_node_start;
+		Point dragged_node_pointer_start;
+		bool is_node_dragging;
 
 		public event EventHandler<GraphReferenceEventArgs>? NavigateRequested;
 		public event EventHandler<GraphReferenceEventArgs>? RootRequested;
 		public event EventHandler<GraphReferenceEventArgs>? SelectionChanged;
+		public event EventHandler? VisibleMethodsChanged;
 
 		public double Zoom {
 			get => scale_transform.ScaleX;
@@ -59,6 +122,7 @@ namespace dnSpy.CallGraph.Controls {
 					return;
 				scale_transform.ScaleX = next;
 				scale_transform.ScaleY = next;
+				UpdateExtent();
 			}
 		}
 
@@ -68,6 +132,9 @@ namespace dnSpy.CallGraph.Controls {
 			this.theme_service = theme_service;
 			Focusable = true;
 			canvas = new Canvas { MinWidth = 1, MinHeight = 1, ClipToBounds = false };
+			edge_layer = new EdgeLayer(this);
+			visibility_timer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(35) };
+			visibility_timer.Tick += (_, __) => { visibility_timer.Stop(); UpdateVisibleNodes(); };
 			canvas.SetResourceReference(Panel.BackgroundProperty, "SystemColorsWindow");
 			
 			
@@ -75,9 +142,11 @@ namespace dnSpy.CallGraph.Controls {
 			TextOptions.SetTextFormattingMode(canvas, TextFormattingMode.Ideal);
 			RenderOptions.SetBitmapScalingMode(canvas, BitmapScalingMode.HighQuality);
 			scale_transform = new ScaleTransform(1, 1);
-			canvas.LayoutTransform = scale_transform;
+			canvas.RenderTransform = scale_transform;
+			extent_host = new Canvas { ClipToBounds = false };
+			extent_host.Children.Add(canvas);
 			pan_host = new Border {
-				Child = canvas,
+				Child = extent_host,
 				Padding = new Thickness(MinimumHorizontalPanSpace, MinimumVerticalPanSpace,
 					MinimumHorizontalPanSpace, MinimumVerticalPanSpace),
 			};
@@ -93,6 +162,7 @@ namespace dnSpy.CallGraph.Controls {
 			};
 			scroll_viewer.SetResourceReference(Control.BackgroundProperty, "SystemColorsWindow");
 			scroll_viewer.SizeChanged += (_, __) => UpdatePanSpace();
+			scroll_viewer.ScrollChanged += (_, __) => { visibility_timer.Stop(); visibility_timer.Start(); };
 			Content = scroll_viewer;
 
 			PreviewMouseWheel += OnPreviewMouseWheel;
@@ -109,6 +179,12 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		internal void SetThemeService(IThemeService value) => theme_service = value;
+		void UpdateExtent() {
+			extent_host.Width = Math.Max(1, canvas.Width * Zoom);
+			extent_host.Height = Math.Max(1, canvas.Height * Zoom);
+			edge_layer.Width = Math.Max(1, canvas.Width);
+			edge_layer.Height = Math.Max(1, canvas.Height);
+		}
 
 		void UpdatePanSpace() {
 			double width = scroll_viewer.ViewportWidth > 0 ? scroll_viewer.ViewportWidth : scroll_viewer.ActualWidth;
@@ -121,13 +197,19 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		public void Clear(string? message = null) {
+			visibility_timer.Stop();
+			edge_layer.InvalidateDrawing();
 			canvas.Children.Clear();
 			node_borders.Clear();
+			cached_borders.Clear();
+			node_presentations.Clear();
+			node_snippets.Clear();
 			node_rects.Clear();
-			colored_runs.Clear();
+			edge_visuals.Clear();
 			root_reference = selected_reference = null;
 			canvas.Width = Math.Max(1, ActualWidth);
 			canvas.Height = Math.Max(1, ActualHeight);
+			UpdateExtent();
 			if (!string.IsNullOrWhiteSpace(message)) {
 				var text = new TextBlock {
 					Text = message,
@@ -145,12 +227,13 @@ namespace dnSpy.CallGraph.Controls {
 			var nodes = slice.Nodes.Select(node => new GraphNodePresentation(
 				node.Method, node.Layer, node.IsRoot, node.IsExternal,
 				node.Method.Name,
-				node.Method.DeclaringType?.FullName ?? "<Module>",
-				CallGraphIndex.Signature(node.Method),
+				(node.Method.DeclaringType?.FullName ?? "<Module>") + (AnalysisDetails.Summary(slice, node.Method).Length == 0 ? string.Empty : " • " + AnalysisDetails.Summary(slice, node.Method)),
+				CallGraphIndex.Signature(node.Method) + $"   token 0x{node.Method.MDToken.Raw:X8}" + AnalysisDetails.ToolTip(slice, node.Method),
 				CallGraphIndex.DisplayName(node.Method))).ToArray();
 			var links = slice.Links.Select(link => new GraphLinkPresentation(
 				link.Source, link.Target, link.CallSiteCount, BuildLinkToolTip(link),
-				string.Empty, link.IsPotential ? GraphLinkKind.PossibleCall : GraphLinkKind.Call)).ToArray();
+				link.OpCodes.Contains("calli") ? "calli" : link.OpCodes.Contains("delegate invoke") ? "delegate" : link.OpCodes.Contains("reflection invoke") ? "reflection" : link.OpCodes.Contains("state machine") ? "async" : link.OpCodes.Contains("scheduled callback") ? "callback" : link.OpCodes.Contains("dynamic invoke") ? "dynamic" : string.Empty,
+				link.IsPotential ? GraphLinkKind.PossibleCall : GraphLinkKind.Call)).ToArray();
 			RenderCore(new GraphPresentation(nodes, links),
 				snippets.ToDictionary(pair => (object)pair.Key, pair => pair.Value),
 				UiText.Pick("No calls were found for the selected method.", "Для выбранного метода вызовы не найдены."), false);
@@ -183,8 +266,11 @@ namespace dnSpy.CallGraph.Controls {
 			string empty_message, bool use_vertical_layout) {
 			canvas.Children.Clear();
 			node_borders.Clear();
+			cached_borders.Clear();
 			node_rects.Clear();
-			colored_runs.Clear();
+			edge_visuals.Clear();
+			node_presentations.Clear();
+			node_snippets.Clear();
 			root_reference = graph.Nodes.FirstOrDefault(node => node.IsRoot)?.Reference;
 			selected_reference = root_reference;
 			vertical_layout = use_vertical_layout;
@@ -198,7 +284,6 @@ namespace dnSpy.CallGraph.Controls {
 			}
 
 			var heights = new Dictionary<object, double>();
-			var code_blocks = new Dictionary<object, TextBlock>();
 			var column_heights = new Dictionary<int, double>();
 			var layer_widths = new Dictionary<int, double>();
 			var layer_maximum_heights = new Dictionary<int, double>();
@@ -207,12 +292,13 @@ namespace dnSpy.CallGraph.Controls {
 				double width = 0;
 				double maximum_height = 0;
 				foreach (var node in group) {
+					node_presentations[node.Reference] = node;
 					var code = snippets.TryGetValue(node.Reference, out var snippet)
 						? snippet
 						: HighlightedSnippet.Plain(string.Empty);
 					var code_block = CreateCodeTextBlock(code);
 					double node_height = MeasureNodeHeight(code_block);
-					code_blocks[node.Reference] = code_block;
+					node_snippets[node.Reference] = code;
 					heights[node.Reference] = node_height;
 					height += node_height + NodeGap;
 					width += node_width + NodeGap;
@@ -257,29 +343,164 @@ namespace dnSpy.CallGraph.Controls {
 				canvas.Height = Math.Max(CanvasMargin * 2 + maximum_column_height, 420);
 			}
 
+			UpdateExtent();
+			canvas.Children.Add(edge_layer);
 			foreach (var link in graph.Links)
 				AddEdge(link);
-			foreach (var node in graph.Nodes)
-				AddNode(node, code_blocks[node.Reference]);
+			edge_layer.InvalidateDrawing();
 
-			Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(CenterRoot));
+			Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => { CenterRoot(); UpdateVisibleNodes(); }));
+		}
+
+		Rect VisibleGraphRect() {
+			double width = Math.Max(1, scroll_viewer.ViewportWidth);
+			double height = Math.Max(1, scroll_viewer.ViewportHeight);
+			var rect = new Rect((scroll_viewer.HorizontalOffset - pan_host.Padding.Left) / Zoom,
+				(scroll_viewer.VerticalOffset - pan_host.Padding.Top) / Zoom, width / Zoom, height / Zoom);
+			rect.Inflate(80 / Zoom, 80 / Zoom);
+			return rect;
+		}
+
+		public IReadOnlyList<MethodDef> VisibleMethods() {
+			var viewport = VisibleGraphRect();
+			return node_rects.Where(pair => pair.Key is MethodDef && pair.Value.IntersectsWith(viewport))
+				.OrderBy(pair => Equals(pair.Key, root_reference) ? 0 : 1)
+				.ThenBy(pair => Math.Abs(pair.Value.Top - viewport.Top))
+				.Select(pair => (MethodDef)pair.Key).ToArray();
+		}
+
+		void UpdateVisibleNodes() {
+			if (updating_visibility || node_presentations.Count == 0) return;
+			updating_visibility = true;
+			try {
+				var viewport = VisibleGraphRect();
+				foreach (var reference in node_borders.Keys.ToArray()) {
+					if (Equals(reference, dragged_node_reference) || node_rects[reference].IntersectsWith(viewport)) continue;
+					canvas.Children.Remove(node_borders[reference]);
+					node_borders.Remove(reference);
+				}
+				int added = 0;
+				bool more = false;
+				foreach (var pair in node_rects) {
+					if (node_borders.ContainsKey(pair.Key) || !pair.Value.IntersectsWith(viewport)) continue;
+					if (++added > 12) { more = true; break; }
+					AddNode(node_presentations[pair.Key], CreateCodeTextBlock(node_snippets[pair.Key]));
+				}
+				if (more && !visibility_update_pending) {
+					visibility_update_pending = true;
+					Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(() => { visibility_update_pending = false; UpdateVisibleNodes(); }));
+				}
+			}
+			finally { updating_visibility = false; }
+			VisibleMethodsChanged?.Invoke(this, EventArgs.Empty);
+		}
+
+		public void UpdateSnippets(IReadOnlyDictionary<MethodDef, HighlightedSnippet> snippets) {
+			bool geometry_changed = false;
+			foreach (var pair in snippets) {
+				if (!node_rects.TryGetValue(pair.Key, out var old_rect) ||
+					node_snippets.TryGetValue(pair.Key, out var previous) && ReferenceEquals(previous, pair.Value)) continue;
+				node_snippets[pair.Key] = pair.Value;
+				var code = CreateCodeTextBlock(pair.Value);
+				double height = MeasureNodeHeight(code);
+				double delta = height - old_rect.Height;
+				node_rects[pair.Key] = new Rect(old_rect.Location, new Size(old_rect.Width, height));
+				if (cached_borders.TryGetValue(pair.Key, out var border)) {
+					var grid = (Grid)border.Child;
+					grid.Children.RemoveAt(2); Grid.SetRow(code, 2); grid.Children.Add(code); border.Height = height;
+				}
+				if (Math.Abs(delta) < 0.5) continue;
+				geometry_changed = true;
+				foreach (var reference in node_rects.Keys.ToArray()) {
+					if (Equals(reference, pair.Key)) continue;
+					var rect = node_rects[reference];
+					if (Math.Abs(rect.Left - old_rect.Left) > 0.5 || rect.Top <= old_rect.Top) continue;
+					rect.Y += delta; node_rects[reference] = rect;
+					if (node_borders.TryGetValue(reference, out var moved)) Canvas.SetTop(moved, rect.Top);
+				}
+			}
+			canvas.Height = Math.Max(420, node_rects.Values.Select(rect => rect.Bottom + CanvasMargin).DefaultIfEmpty(420).Max());
+			UpdateExtent();
+			if (geometry_changed) {
+				foreach (var visual in edge_visuals) UpdateEdge(visual);
+				edge_layer.InvalidateDrawing();
+			}
+			UpdateVisibleNodes();
 		}
 
 		public void Render(CallGraphSlice slice, IReadOnlyDictionary<MethodDef, string> snippets) =>
 			Render(slice, snippets.ToDictionary(pair => pair.Key, pair => HighlightedSnippet.Plain(pair.Value)));
 
-		double MeasureNodeHeight(TextBlock text) {
-			double available_width = Math.Max(1, node_width - 16);
+		double MeasureNodeHeight(FrameworkElement text) {
+			double available_width = Math.Max(1, node_width - 4);
 			text.Measure(new Size(available_width, double.PositiveInfinity));
 			return Math.Max(MinimumNodeHeight,
-				Math.Ceiling(HeaderHeight + 1 + CodeVerticalMargin + text.DesiredSize.Height + 1));
+				Math.Ceiling(HeaderHeight + 1 + text.DesiredSize.Height + 4));
 		}
 
 		void AddEdge(GraphLinkPresentation link) {
+			if (!TryGetEdgePlacement(link, out var placement))
+				return;
+			bool emphasized = Equals(link.Source, root_reference) || Equals(link.Target, root_reference);
+			var path = new Path {
+				Data = CreateCurveGeometry(placement),
+				StrokeThickness = emphasized ? 1.8 : 1.15,
+				Opacity = emphasized ? 0.82 : 0.52,
+				ToolTip = link.ToolTip,
+				IsHitTestVisible = true,
+			};
+			if (link.Kind == GraphLinkKind.Exception || link.Kind == GraphLinkKind.PossibleCall)
+				path.StrokeDashArray = new DoubleCollection { 4, 3 };
+			path.SetResourceReference(Shape.StrokeProperty,
+				emphasized || link.Kind == GraphLinkKind.Conditional || link.Kind == GraphLinkKind.Switch
+					? "HyperlinkNormal" : "SystemColorsWindowText");
+			Panel.SetZIndex(path, 0);
+
+			var arrow = CreateArrow(placement.To, placement.Control2, emphasized);
+			FrameworkElement? label = null;
+			Vector label_offset = default;
+			if (link.CallSiteCount > 1) {
+				label = CreateCallCount(link.CallSiteCount);
+				label_offset = new Vector(-9, -9);
+			}
+			else if (!string.IsNullOrEmpty(link.Label)) {
+				label = CreateEdgeLabel(link.Label);
+				label_offset = new Vector(3, -10);
+			}
+			if (label is not null) {
+				Canvas.SetLeft(label, placement.LabelPoint.X + label_offset.X);
+				Canvas.SetTop(label, placement.LabelPoint.Y + label_offset.Y);
+			}
+			edge_visuals.Add(new EdgeVisual(link, path, arrow, label, label_offset));
+		}
+
+		void DrawEdges(DrawingContext context) {
+			var accent = (TryFindResource("HyperlinkNormal") as Brush ?? Brushes.DeepSkyBlue).CloneCurrentValue();
+			var text = TryFindResource("SystemColorsWindowText") as Brush ?? Brushes.Gainsboro;
+			var normal = text.CloneCurrentValue(); normal.Opacity = 0.52; accent.Opacity = 0.82;
+			var background = TryFindResource("SystemColorsWindow") as Brush ?? Brushes.Black;
+			var normal_pen = new Pen(normal, 1.15);
+			var accent_pen = new Pen(accent, 1.8);
+			var dashed_pen = new Pen(accent, 1.3) { DashStyle = new DashStyle(new[] { 4.0, 3.0 }, 0) };
+			foreach (var edge in edge_visuals) {
+				bool emphasized = Equals(edge.Link.Source, root_reference) || Equals(edge.Link.Target, root_reference) || edge.Link.Kind == GraphLinkKind.Conditional || edge.Link.Kind == GraphLinkKind.Switch;
+				bool dashed = edge.Link.Kind == GraphLinkKind.PossibleCall || edge.Link.Kind == GraphLinkKind.Exception;
+				context.DrawGeometry(null, dashed ? dashed_pen : emphasized ? accent_pen : normal_pen, edge.Curve.Data);
+				context.DrawGeometry(emphasized || dashed ? accent : normal, null, edge.Arrow.Data);
+				if (edge.Label is not TextBlock label) continue;
+				var formatted = new FormattedText(label.Text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+					new Typeface("Segoe UI"), label.FontSize, text, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+				var point = new Point(Canvas.GetLeft(label), Canvas.GetTop(label));
+				context.DrawRectangle(background, null, new Rect(point, new Size(formatted.Width + 3, formatted.Height)));
+				context.DrawText(formatted, point);
+			}
+		}
+
+		bool TryGetEdgePlacement(GraphLinkPresentation link, out EdgePlacement placement) {
+			placement = default;
 			if (!node_rects.TryGetValue(link.Source, out var source_rect) ||
 				!node_rects.TryGetValue(link.Target, out var target_rect))
-				return;
-
+				return false;
 			Point from;
 			Point to;
 			Point control1;
@@ -325,31 +546,14 @@ namespace dnSpy.CallGraph.Controls {
 				control2 = new Point(control_x, to.Y);
 				label_point = new Point(control_x, (from.Y + to.Y) / 2);
 			}
+			placement = new EdgePlacement(from, to, control1, control2, label_point);
+			return true;
+		}
 
-			var figure = new PathFigure { StartPoint = from, IsClosed = false, IsFilled = false };
-			figure.Segments.Add(new BezierSegment(control1, control2, to, true));
-			var geometry = new PathGeometry(new[] { figure });
-			var path = new Path {
-				Data = geometry,
-				StrokeThickness = Equals(link.Source, root_reference) || Equals(link.Target, root_reference) ? 1.8 : 1.15,
-				Opacity = Equals(link.Source, root_reference) || Equals(link.Target, root_reference) ? 0.82 : 0.52,
-				ToolTip = link.ToolTip,
-				IsHitTestVisible = true,
-			};
-			if (link.Kind == GraphLinkKind.Exception || link.Kind == GraphLinkKind.PossibleCall)
-				path.StrokeDashArray = new DoubleCollection { 4, 3 };
-			path.SetResourceReference(Shape.StrokeProperty,
-				Equals(link.Source, root_reference) || Equals(link.Target, root_reference) ||
-				link.Kind == GraphLinkKind.Conditional || link.Kind == GraphLinkKind.Switch
-					? "HyperlinkNormal" : "SystemColorsWindowText");
-			Panel.SetZIndex(path, 0);
-			canvas.Children.Add(path);
-
-			AddArrow(to, control2, Equals(link.Source, root_reference) || Equals(link.Target, root_reference));
-			if (link.CallSiteCount > 1)
-				AddCallCount(link.CallSiteCount, label_point);
-			else if (!string.IsNullOrEmpty(link.Label))
-				AddEdgeLabel(link.Label, label_point);
+		static Geometry CreateCurveGeometry(EdgePlacement placement) {
+			var figure = new PathFigure { StartPoint = placement.From, IsClosed = false, IsFilled = false };
+			figure.Segments.Add(new BezierSegment(placement.Control1, placement.Control2, placement.To, true));
+			return new PathGeometry(new[] { figure });
 		}
 
 		static string BuildLinkToolTip(CallGraphLink link) {
@@ -363,11 +567,12 @@ namespace dnSpy.CallGraph.Controls {
 				$"{link.CallSiteCount} call site(s): {string.Join(", ", link.OpCodes)}\n{offsets}";
 		}
 
-		void AddArrow(Point tip, Point from, bool emphasized) {
+		Path CreateArrow(Point tip, Point from, bool emphasized) {
 			Vector vector = tip - from;
-			if (vector.LengthSquared < 1)
-				return;
-			vector.Normalize();
+			if (vector.LengthSquared >= 1)
+				vector.Normalize();
+			else
+				vector = new Vector(1, 0);
 			Vector perpendicular = new Vector(-vector.Y, vector.X);
 			double length = emphasized ? 10 : 8;
 			double width = emphasized ? 4.8 : 4;
@@ -382,10 +587,10 @@ namespace dnSpy.CallGraph.Controls {
 			var arrow = new Path { Data = geometry, Opacity = emphasized ? 0.9 : 0.62, IsHitTestVisible = false };
 			arrow.SetResourceReference(Shape.FillProperty, emphasized ? "HyperlinkNormal" : "SystemColorsWindowText");
 			Panel.SetZIndex(arrow, 0);
-			canvas.Children.Add(arrow);
+			return arrow;
 		}
 
-		void AddCallCount(int count, Point point) {
+		TextBlock CreateCallCount(int count) {
 			var label = new TextBlock {
 				Text = "×" + count.ToString(CultureInfo.InvariantCulture),
 				FontSize = 10,
@@ -395,12 +600,10 @@ namespace dnSpy.CallGraph.Controls {
 			label.SetResourceReference(TextBlock.BackgroundProperty, "SystemColorsWindow");
 			label.SetResourceReference(TextBlock.ForegroundProperty, "SystemColorsWindowText");
 			Panel.SetZIndex(label, 1);
-			canvas.Children.Add(label);
-			Canvas.SetLeft(label, point.X - 9);
-			Canvas.SetTop(label, point.Y - 9);
+			return label;
 		}
 
-		void AddEdgeLabel(string text, Point point) {
+		TextBlock CreateEdgeLabel(string text) {
 			var label = new TextBlock {
 				Text = text,
 				FontSize = 9.5,
@@ -409,13 +612,37 @@ namespace dnSpy.CallGraph.Controls {
 			label.SetResourceReference(TextBlock.BackgroundProperty, "SystemColorsWindow");
 			label.SetResourceReference(TextBlock.ForegroundProperty, "SystemColorsWindowText");
 			Panel.SetZIndex(label, 1);
-			canvas.Children.Add(label);
-			Canvas.SetLeft(label, point.X + 3);
-			Canvas.SetTop(label, point.Y - 10);
+			return label;
 		}
 
-		void AddNode(GraphNodePresentation node, TextBlock code_text) {
+		void UpdateConnectedEdges(object reference) {
+			foreach (var visual in edge_visuals) {
+				if (!Equals(visual.Link.Source, reference) && !Equals(visual.Link.Target, reference))
+					continue;
+				UpdateEdge(visual);
+			}
+			edge_layer.InvalidateDrawing();
+		}
+
+		void UpdateEdge(EdgeVisual visual) {
+			if (!TryGetEdgePlacement(visual.Link, out var placement)) return;
+			visual.Curve.Data = CreateCurveGeometry(placement);
+			visual.Arrow.Data = CreateArrow(placement.To, placement.Control2,
+				Equals(visual.Link.Source, root_reference) || Equals(visual.Link.Target, root_reference)).Data;
+			if (visual.Label is not null) {
+				Canvas.SetLeft(visual.Label, placement.LabelPoint.X + visual.LabelOffset.X);
+				Canvas.SetTop(visual.Label, placement.LabelPoint.Y + visual.LabelOffset.Y);
+			}
+		}
+
+		void AddNode(GraphNodePresentation node, GraphCodeText code_text) {
 			Rect rect = node_rects[node.Reference];
+			if (cached_borders.TryGetValue(node.Reference, out var cached)) {
+				node_borders[node.Reference] = cached;
+				cached.BorderThickness = Equals(selected_reference, node.Reference) || node.IsRoot ? new Thickness(2) : new Thickness(1);
+				cached.SetResourceReference(Border.BorderBrushProperty, Equals(selected_reference, node.Reference) && !node.IsRoot ? "ToolBarButtonHoverBorder" : node.IsRoot ? "HyperlinkNormal" : "CommonControlsTextBoxBorder");
+				canvas.Children.Add(cached); Canvas.SetLeft(cached, rect.Left); Canvas.SetTop(cached, rect.Top); return;
+			}
 			var border = new Border {
 				Width = rect.Width,
 				Height = rect.Height,
@@ -427,6 +654,7 @@ namespace dnSpy.CallGraph.Controls {
 			};
 			border.SetResourceReference(Border.BackgroundProperty, "SystemColorsWindow");
 			border.SetResourceReference(Border.BorderBrushProperty,
+				Equals(node.Reference, selected_reference) && !node.IsRoot ? "ToolBarButtonHoverBorder" :
 				node.IsRoot ? "HyperlinkNormal" : "CommonControlsTextBoxBorder");
 
 			var grid = new Grid();
@@ -445,80 +673,28 @@ namespace dnSpy.CallGraph.Controls {
 			border.Child = grid;
 
 			border.MouseLeftButtonDown += OnNodeMouseLeftButtonDown;
-			border.ContextMenu = CreateNodeContextMenu(node);
+			var lazy_menu = new ContextMenu();
+			bool menu_created = false;
+			lazy_menu.Opened += (_, __) => {
+				if (menu_created) return;
+				menu_created = true;
+				var populated = CreateNodeContextMenu(node);
+				while (populated.Items.Count != 0) { var item = populated.Items[0]; populated.Items.RemoveAt(0); lazy_menu.Items.Add(item); }
+			};
+			border.ContextMenu = lazy_menu;
 			node_borders[node.Reference] = border;
+			cached_borders[node.Reference] = border;
 			Panel.SetZIndex(border, 2);
 			canvas.Children.Add(border);
 			Canvas.SetLeft(border, rect.Left);
 			Canvas.SetTop(border, rect.Top);
 		}
 
-		TextBlock CreateCodeTextBlock(HighlightedSnippet code) {
-			var code_text = new TextBlock {
-				Margin = new Thickness(8, 6, 8, 6),
-				FontFamily = new FontFamily("Consolas"),
-				FontSize = 11.5,
-				TextWrapping = wrap_long_lines ? TextWrapping.Wrap : TextWrapping.NoWrap,
-				Focusable = false,
-			};
-			code_text.SetResourceReference(TextBlock.ForegroundProperty, "SystemColorsWindowText");
-			AddCodeInlines(code_text, code);
-			TextOptions.SetTextRenderingMode(code_text, TextRenderingMode.Grayscale);
-			TextOptions.SetTextHintingMode(code_text, TextHintingMode.Animated);
-			return code_text;
-		}
-
-		void AddCodeInlines(TextBlock text_block, HighlightedSnippet snippet) {
-			if (snippet.Spans.Count == 0) {
-				text_block.Text = snippet.Text;
-				return;
-			}
-
-			int position = 0;
-			foreach (var span in snippet.Spans.OrderBy(item => item.Start)) {
-				if (span.Start < position || span.Start >= snippet.Text.Length || span.Length <= 0)
-					continue;
-				if (span.Start > position)
-					text_block.Inlines.Add(new Run(snippet.Text.Substring(position, span.Start - position)));
-				int length = Math.Min(span.Length, snippet.Text.Length - span.Start);
-				var run = new Run(snippet.Text.Substring(span.Start, length));
-				if (syntax_highlighting)
-					ApplySyntaxColor(run, span.Color);
-				if (span.Reference is IMethod method_reference) {
-					run.Cursor = Cursors.Hand;
-					run.ToolTip = UiText.DoubleClickExplore(method_reference.FullName);
-					run.ContextMenu = CreateMethodReferenceContextMenu(method_reference);
-					run.MouseEnter += (_, __) => run.TextDecorations = TextDecorations.Underline;
-					run.MouseLeave += (_, __) => run.TextDecorations = null;
-					run.MouseLeftButtonDown += (_, e) => {
-						if (e.ClickCount != 2)
-							return;
-						if (CallGraphControl.ResolveMethod(method_reference) is MethodDef definition)
-							RootRequested?.Invoke(this, new GraphReferenceEventArgs(definition));
-						e.Handled = true;
-					};
-				}
-				if (syntax_highlighting)
-					colored_runs.Add((run, span.Color));
-				text_block.Inlines.Add(run);
-				position = span.Start + length;
-			}
-			if (position < snippet.Text.Length)
-				text_block.Inlines.Add(new Run(snippet.Text.Substring(position)));
-		}
-
-		void ApplySyntaxColor(Run run, TextColor text_color) {
-			if (theme_service is null)
-				return;
-			uint color_value = (uint)ColorType.Text + (uint)text_color;
-			var color = theme_service.Theme.GetTextColor((ColorType)color_value);
-			if (color.Foreground is not null)
-				run.Foreground = color.Foreground;
-			if (color.FontWeight is not null)
-				run.FontWeight = color.FontWeight.Value;
-			if (color.FontStyle is not null)
-				run.FontStyle = color.FontStyle.Value;
-		}
+		GraphCodeText CreateCodeTextBlock(HighlightedSnippet code) => new GraphCodeText(code, theme_service,
+			syntax_highlighting, wrap_long_lines, reference => {
+				if (CallGraphControl.ResolveMethod(reference) is MethodDef method)
+					RootRequested?.Invoke(this, new GraphReferenceEventArgs(method));
+			}, CreateMethodReferenceContextMenu);
 
 		FrameworkElement CreateHeader(GraphNodePresentation node) {
 			var panel = new Grid { MinHeight = 47 };
@@ -534,6 +710,10 @@ namespace dnSpy.CallGraph.Controls {
 				Margin = new Thickness(8, 5, 8, 0),
 			};
 			name.SetResourceReference(TextBlock.ForegroundProperty, "SystemColorsWindowText");
+			if (theme_service is not null && node.Reference is MethodDef method) {
+				var color = theme_service.Theme.GetTextColor((ColorType)((uint)ColorType.Text + (uint)(method.IsStatic ? TextColor.StaticMethod : TextColor.InstanceMethod)));
+				if (color.Foreground is not null) name.Foreground = color.Foreground;
+			}
 			panel.Children.Add(name);
 
 			string subtitle = node.Subtitle;
@@ -678,12 +858,17 @@ namespace dnSpy.CallGraph.Controls {
 			pan_button = e.ChangedButton;
 			is_pan_candidate = true;
 			is_panning = false;
+			is_node_dragging = false;
 			pan_start = e.GetPosition(this);
 			pan_horizontal_offset = scroll_viewer.HorizontalOffset;
 			pan_vertical_offset = scroll_viewer.VerticalOffset;
-			
-			
-			
+			dragged_node_reference = e.ChangedButton == MouseButton.Left && e.ClickCount == 1
+				? FindNodeReference(e.OriginalSource as DependencyObject)
+				: null;
+			if (dragged_node_reference is not null && node_rects.TryGetValue(dragged_node_reference, out var rect)) {
+				dragged_node_start = rect;
+				dragged_node_pointer_start = e.GetPosition(canvas);
+			}
 			if (pan_button == MouseButton.Middle)
 				e.Handled = true;
 		}
@@ -699,6 +884,26 @@ namespace dnSpy.CallGraph.Controls {
 				return;
 			}
 			Point current = e.GetPosition(this);
+			if (dragged_node_reference is not null) {
+				Vector screen_delta = current - pan_start;
+				if (!is_node_dragging && Math.Abs(screen_delta.X) < SystemParameters.MinimumHorizontalDragDistance &&
+					Math.Abs(screen_delta.Y) < SystemParameters.MinimumVerticalDragDistance)
+					return;
+				if (!is_node_dragging) {
+					is_node_dragging = true;
+					Mouse.Capture(this);
+					Cursor = Cursors.SizeAll;
+					if (node_borders.TryGetValue(dragged_node_reference, out var dragged_border))
+						Panel.SetZIndex(dragged_border, 4);
+				}
+				Point canvas_point = e.GetPosition(canvas);
+				Vector delta = canvas_point - dragged_node_pointer_start;
+				MoveNode(dragged_node_reference,
+					Math.Max(0, dragged_node_start.Left + delta.X),
+					Math.Max(0, dragged_node_start.Top + delta.Y));
+				e.Handled = true;
+				return;
+			}
 			if (!is_panning) {
 				Vector delta = current - pan_start;
 				if (Math.Abs(delta.X) < SystemParameters.MinimumHorizontalDragDistance &&
@@ -716,18 +921,55 @@ namespace dnSpy.CallGraph.Controls {
 		void OnPreviewMouseUp(object sender, MouseButtonEventArgs e) {
 			if (!is_pan_candidate || e.ChangedButton != pan_button)
 				return;
-			bool handled = is_panning || pan_button == MouseButton.Middle;
+			bool handled = is_panning || is_node_dragging || pan_button == MouseButton.Middle;
 			EndPan();
 			e.Handled = handled;
 		}
 
 		void EndPan() {
 			bool had_capture = IsMouseCaptured;
+			if (dragged_node_reference is not null && node_borders.TryGetValue(dragged_node_reference, out var dragged_border))
+				Panel.SetZIndex(dragged_border, 2);
 			is_pan_candidate = false;
 			is_panning = false;
+			is_node_dragging = false;
+			dragged_node_reference = null;
 			Cursor = Cursors.Arrow;
 			if (had_capture)
 				Mouse.Capture(null);
+		}
+
+		object? FindNodeReference(DependencyObject? source) {
+			var current = source;
+			while (current is not null) {
+				if (current is Border border && border.Tag is not null &&
+					node_borders.TryGetValue(border.Tag, out var node_border) && ReferenceEquals(border, node_border))
+					return border.Tag;
+				if (current is FrameworkContentElement content) {
+					current = content.Parent;
+					continue;
+				}
+				if (current is FrameworkElement element && element.Parent is not null) {
+					current = element.Parent;
+					continue;
+				}
+				try { current = VisualTreeHelper.GetParent(current); }
+				catch (InvalidOperationException) { current = null; }
+			}
+			return null;
+		}
+
+		void MoveNode(object reference, double left, double top) {
+			if (!node_rects.TryGetValue(reference, out var old_rect) || !node_borders.TryGetValue(reference, out var border))
+				return;
+			var rect = new Rect(left, top, old_rect.Width, old_rect.Height);
+			node_rects[reference] = rect;
+			Canvas.SetLeft(border, rect.Left);
+			Canvas.SetTop(border, rect.Top);
+			canvas.Width = Math.Max(canvas.Width, rect.Right + CanvasMargin);
+			canvas.Height = Math.Max(canvas.Height, rect.Bottom + CanvasMargin);
+			UpdateExtent();
+			UpdateConnectedEdges(reference);
 		}
 	}
 }

@@ -9,7 +9,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>CallGraph.Extension.x</AssemblyName>
     <RootNamespace>dnSpy.CallGraph</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.7.5</Version>
     <Authors>dnSpy Call Graph contributors</Authors>
     <Description>Call graph, function map, and IL control-flow graph extension for dnSpyEx.</Description>
     <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
@@ -24,6 +24,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="validation\**\*.cs" />
     <Reference Include="dnSpy.Contracts.DnSpy">
       <HintPath>$(DnSpyBinDir)\dnSpy.Contracts.DnSpy.dll</HintPath>
       <Private>false</Private>

@@ -20,10 +20,12 @@ namespace dnSpy.CallGraph {
 
 		public int MaximumLines { get; private set; } = 0;
 		public int EffectiveMaximumLines => MaximumLines <= 0 ? 80 : MaximumLines;
+		public int GetMaximumLines(int method_count) => MaximumLines <= 0 && method_count > 120 ? 32 : EffectiveMaximumLines;
 		public double BlockWidth { get; private set; } = 430;
 		public bool WrapLongLines { get; private set; } = true;
 		public bool SyntaxHighlighting { get; private set; } = true;
 		public bool HideSystemMethods { get; private set; }
+		public bool OnlyCurrentAssembly { get; private set; }
 		public bool HideAccessors { get; private set; }
 		public bool HideConstructors { get; private set; }
 		public bool OnlyCurrentNamespace { get; private set; }
@@ -45,6 +47,7 @@ namespace dnSpy.CallGraph {
 			WrapLongLines = section.Attribute<bool?>(nameof(WrapLongLines)) ?? WrapLongLines;
 			SyntaxHighlighting = section.Attribute<bool?>(nameof(SyntaxHighlighting)) ?? SyntaxHighlighting;
 			HideSystemMethods = section.Attribute<bool?>(nameof(HideSystemMethods)) ?? HideSystemMethods;
+			OnlyCurrentAssembly = section.Attribute<bool?>(nameof(OnlyCurrentAssembly)) ?? OnlyCurrentAssembly;
 			HideAccessors = section.Attribute<bool?>(nameof(HideAccessors)) ?? HideAccessors;
 			HideConstructors = section.Attribute<bool?>(nameof(HideConstructors)) ?? HideConstructors;
 			OnlyCurrentNamespace = section.Attribute<bool?>(nameof(OnlyCurrentNamespace)) ?? OnlyCurrentNamespace;
@@ -58,12 +61,13 @@ namespace dnSpy.CallGraph {
 		}
 
 		public CallGraphFilterOptions CreateFilterOptions() => new CallGraphFilterOptions(HideSystemMethods,
-			HideAccessors, HideConstructors, OnlyCurrentNamespace, OnlyCurrentType, RequireMethodBody, MinimumCallSiteCount);
+			HideAccessors, HideConstructors, OnlyCurrentNamespace, OnlyCurrentType, RequireMethodBody, MinimumCallSiteCount, OnlyCurrentAssembly);
 
 		public void Apply(int maximum_lines, double block_width, bool wrap_long_lines, bool syntax_highlighting,
 			bool hide_system_methods, bool hide_accessors, bool hide_constructors, bool only_current_namespace,
 			bool only_current_type, bool require_method_body, int minimum_call_site_count,
-			bool clean_assembly_explorer_on_launch, bool shortcut_enabled, ModifierKeys shortcut_modifiers, Key shortcut_key) {
+			bool clean_assembly_explorer_on_launch, bool shortcut_enabled, ModifierKeys shortcut_modifiers, Key shortcut_key, bool only_current_assembly = false) {
+			OnlyCurrentAssembly = only_current_assembly;
 			MaximumLines = NormalizeLines(maximum_lines);
 			BlockWidth = Clamp(block_width, 320, 900);
 			WrapLongLines = wrap_long_lines;
@@ -88,6 +92,7 @@ namespace dnSpy.CallGraph {
 			section.Attribute(nameof(WrapLongLines), WrapLongLines);
 			section.Attribute(nameof(SyntaxHighlighting), SyntaxHighlighting);
 			section.Attribute(nameof(HideSystemMethods), HideSystemMethods);
+			section.Attribute(nameof(OnlyCurrentAssembly), OnlyCurrentAssembly);
 			section.Attribute(nameof(HideAccessors), HideAccessors);
 			section.Attribute(nameof(HideConstructors), HideConstructors);
 			section.Attribute(nameof(OnlyCurrentNamespace), OnlyCurrentNamespace);
@@ -148,6 +153,7 @@ namespace dnSpy.CallGraph {
 		readonly CheckBox wrap_check_box;
 		readonly CheckBox highlight_check_box;
 		readonly CheckBox hide_system_methods_check_box;
+		readonly CheckBox only_current_assembly_check_box;
 		readonly CheckBox hide_accessors_check_box;
 		readonly CheckBox hide_constructors_check_box;
 		readonly CheckBox only_current_namespace_check_box;
@@ -207,6 +213,9 @@ namespace dnSpy.CallGraph {
 				Margin = new Thickness(0, 0, 0, 8),
 			});
 			hide_system_methods_check_box = FilterCheckBox(UiText.HideSystemMethods, settings.HideSystemMethods);
+			only_current_assembly_check_box = FilterCheckBox(UiText.OnlyCurrentAssembly, settings.OnlyCurrentAssembly);
+			only_current_assembly_check_box.ToolTip = UiText.OnlyCurrentAssemblyDescription;
+			panel.Children.Add(only_current_assembly_check_box);
 			hide_accessors_check_box = FilterCheckBox(UiText.HideAccessors, settings.HideAccessors);
 			hide_constructors_check_box = FilterCheckBox(UiText.HideConstructors, settings.HideConstructors);
 			only_current_namespace_check_box = FilterCheckBox(UiText.OnlyCurrentNamespace, settings.OnlyCurrentNamespace);
@@ -293,7 +302,7 @@ namespace dnSpy.CallGraph {
 				only_current_type_check_box.IsChecked == true, require_method_body_check_box.IsChecked == true,
 				minimum_call_sites_combo_box.SelectedItem is int minimum_call_sites ? minimum_call_sites : 1,
 				clean_explorer_check_box.IsChecked == true, shortcut_enabled_check_box.IsChecked == true,
-				modifiers, key_choice?.Value ?? Key.G);
+				modifiers, key_choice?.Value ?? Key.G, only_current_assembly_check_box.IsChecked == true);
 		}
 
 		void SelectLines(int value) {

@@ -70,6 +70,7 @@ namespace dnSpy.CallGraph.Core {
 		readonly List<ColoredTextSpan> spans = new List<ColoredTextSpan>();
 		readonly Indenter indenter = new Indenter(4, 4, true);
 		readonly int maximum_lines;
+		const int MaximumCharacters = 16000;
 		bool add_indent = true;
 		bool line_has_visible_text;
 		int completed_visible_lines;
@@ -113,7 +114,7 @@ namespace dnSpy.CallGraph.Core {
 			var text_color = color is TextColor detected_color ? detected_color : TextColor.Text;
 			if (IsComment(text_color))
 				return;
-			if (maximum_lines > 0 && completed_visible_lines >= maximum_lines) {
+			if (maximum_lines > 0 && completed_visible_lines >= maximum_lines || builder.Length + length > MaximumCharacters) {
 				truncated = true;
 				throw new SnippetLimitReachedException();
 			}
