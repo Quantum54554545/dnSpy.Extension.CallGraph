@@ -16,9 +16,12 @@ namespace dnSpy.CallGraph {
 		readonly IThemeService theme_service;
 		readonly CallGraphIndexCache index_cache;
 		readonly object? initial_reference;
+		WeakReference<CallGraphDocumentTabUIContext>? active_context;
+		object? ActiveReference => active_context is not null && active_context.TryGetTarget(out var context)
+			? context.Control.CurrentRoot : initial_reference;
 
 		public override string Title => UiText.CallGraph;
-		public override object? ToolTip => initial_reference switch {
+		public override object? ToolTip => ActiveReference switch {
 			MethodDef method => UiText.CallGraph + ": " + CallGraphIndex.DisplayName(method),
 			_ => UiText.Pick("Method call graph, function map and CFG", "Граф вызовов методов, карта функций и CFG"),
 		};
@@ -35,7 +38,7 @@ namespace dnSpy.CallGraph {
 		}
 
 		public override DocumentTabContent Clone() =>
-			new CallGraphDocumentTabContent(document_tab_service, decompiler_service, settings, theme_service, index_cache, initial_reference);
+			new CallGraphDocumentTabContent(document_tab_service, decompiler_service, settings, theme_service, index_cache, ActiveReference);
 
 		public override DocumentTabUIContext CreateUIContext(IDocumentTabUIContextLocator locator) =>
 			locator.Get(UIContextKey, useStrongReference: true,
@@ -43,6 +46,8 @@ namespace dnSpy.CallGraph {
 
 		public override void OnShow(IShowContext ctx) {
 			var ui_context = (CallGraphDocumentTabUIContext)ctx.UIContext;
+			if (ctx.IsRefresh && active_context is not null && active_context.TryGetTarget(out var previous) && ReferenceEquals(previous, ui_context)) return;
+			active_context = new WeakReference<CallGraphDocumentTabUIContext>(ui_context);
 			if (initial_reference is MethodDef method)
 				ui_context.Control.ShowMethod(method);
 			else

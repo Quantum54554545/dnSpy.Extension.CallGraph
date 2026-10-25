@@ -273,6 +273,10 @@ namespace dnSpy.CallGraph.Core {
 			if (module is null)
 				throw new ArgumentNullException(nameof(module));
 			var methods = EnumerateMethods(module, cancellation_token).OrderBy(SafeToken).ToArray();
+			return BuildScope(module, new HashSet<ModuleDef> { module }, methods, cancellation_token);
+		}
+
+		static CallGraphIndex BuildScope(ModuleDef? module, HashSet<ModuleDef> modules, MethodDef[] methods, CancellationToken cancellation_token) {
 			var call_sites = new Dictionary<(MethodDef Source, MethodDef Target), CallSiteAccumulator>();
 			var virtual_sites = new List<VirtualCallSite>();
 			var reflection_sites = new List<ReflectionTarget>();
@@ -304,35 +308,30 @@ namespace dnSpy.CallGraph.Core {
 				catch (OperationCanceledException) { throw; }
 				catch (Exception error) { skipped++; safety_notes.Add(new GraphDiagnostic(method, 0, GraphDiagnosticKind.InvalidIl, "IL scan failed: " + error.GetType().Name)); }
 			}
-			var analysis = new ReachableCallAnalysis(new[] { module }, cancellation_token);
+			var analysis = new ReachableCallAnalysis(modules, cancellation_token);
 			skipped += analysis.ScanIndex(methods, call_sites, virtual_sites, reflection_sites);
-			var index = Create(module, new HashSet<ModuleDef> { module }, new HashSet<MethodDef>(methods), call_sites, virtual_sites, reflection_sites, skipped);
-			index.diagnostics = safety_notes.Concat(analysis.Diagnostics).ToArray(); return index;
+			var index = Create(module, modules, new HashSet<MethodDef>(methods), call_sites, virtual_sites, reflection_sites, skipped);
+			index.diagnostics = safety_notes.Concat(analysis.Diagnostics).ToArray();
+			index.unresolved_calli.Clear();
+			foreach (var pair in analysis.UnresolvedIndirectSites) index.unresolved_calli[pair.Key] = pair.Value;
+			return index;
 		}
 
-		public static CallGraphIndex Combine(IEnumerable<CallGraphIndex> module_indexes) {
+		public static CallGraphIndex Combine(IEnumerable<CallGraphIndex> module_indexes, CancellationToken cancellation_token = default) {
 			if (module_indexes is null)
 				throw new ArgumentNullException(nameof(module_indexes));
+			cancellation_token.ThrowIfCancellationRequested();
 			var indexes = module_indexes.Where(index => index?.Module is not null)
 				.GroupBy(index => index.Module!)
 				.Select(group => group.Last())
 				.ToArray();
 			if (indexes.Length == 0)
 				throw new ArgumentException("At least one single-module index is required.", nameof(module_indexes));
+			cancellation_token.ThrowIfCancellationRequested();
+			if (indexes.Length == 1) return indexes[0];
 			var modules = new HashSet<ModuleDef>(indexes.Select(index => index.Module!));
 			var methods = new HashSet<MethodDef>(indexes.SelectMany(index => index.module_methods));
-			var call_sites = new Dictionary<(MethodDef Source, MethodDef Target), CallSiteAccumulator>();
-			foreach (var link in indexes.SelectMany(index => index.all_links)) {
-				var key = (link.Source, link.Target);
-				if (!call_sites.TryGetValue(key, out var accumulator))
-					call_sites.Add(key, accumulator = new CallSiteAccumulator());
-				accumulator.Add(link);
-			}
-			WorkspaceCallResolver.AddExtendedEdges(methods, indexes.SelectMany(index => index.virtual_call_sites),
-				indexes.SelectMany(index => index.reflection_targets), call_sites);
-			var combined = Create(indexes.Length == 1 ? indexes[0].Module : null, modules, methods, call_sites,
-				Array.Empty<VirtualCallSite>(), Array.Empty<ReflectionTarget>(), indexes.Sum(index => index.SkippedMethodCount));
-			combined.diagnostics = indexes.SelectMany(index => index.diagnostics).ToArray(); return combined;
+			return BuildScope(null, modules, methods.OrderBy(SafeToken).ToArray(), cancellation_token);
 		}
 
 		static CallGraphIndex Create(ModuleDef? module, HashSet<ModuleDef> modules, HashSet<MethodDef> methods,
@@ -466,8 +465,12 @@ namespace dnSpy.CallGraph.Core {
 			while (queue.Count != 0) {
 				cancellation_token.ThrowIfCancellationRequested();
 				var current = queue.Dequeue();
-				if (current.Depth >= maximum_depth || !adjacency.TryGetValue(current.Method, out var links))
+				if (!adjacency.TryGetValue(current.Method, out var links))
 					continue;
+				if (current.Depth >= maximum_depth) {
+					if (links.Any(link => !layers.ContainsKey(select_target(link)) && filter.Includes(root, link, select_target(link)))) truncated = true;
+					continue;
+				}
 				foreach (var link in links.OrderBy(item => DisplayName(select_target(item)), StringComparer.OrdinalIgnoreCase)) {
 					var next = select_target(link);
 					if (!filter.Includes(root, link, next) || !visited.Add(next))

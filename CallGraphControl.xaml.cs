@@ -52,7 +52,21 @@ namespace dnSpy.CallGraph {
 		bool analyzing_graph;
 		bool workspace_update_pending;
 		HashSet<ModuleDef>? graph_modules;
+		HashSet<ModuleDef> observed_modules = new HashSet<ModuleDef>();
 		int current_preview_lines = 80;
+		internal MethodDef? CurrentRoot => current_root;
+		bool IsCurrent(CancellationToken token) => !disposed && !token.IsCancellationRequested &&
+			operation_cancellation is not null && operation_cancellation.Token == token;
+
+		void CancelCurrentWork() {
+			GraphSurface.CancelPendingRender();
+			FunctionMapSurface.CancelPendingRender();
+			operation_cancellation?.Cancel();
+			preview_cancellation?.Cancel();
+			visible_snippets_enabled = false;
+			visible_snippets_requested = false;
+			analyzing_graph = false;
+		}
 
 		readonly struct SnippetCacheKey : IEquatable<SnippetCacheKey> {
 			public readonly MethodDef Definition;
@@ -94,6 +108,7 @@ namespace dnSpy.CallGraph {
 			theme_service.ThemeChanged += ThemeService_ThemeChanged;
 			document_tab_service.DocumentModified += DocumentTabService_DocumentModified;
 			document_tab_service.DocumentCollectionChanged += DocumentTabService_DocumentCollectionChanged;
+			observed_modules = new HashSet<ModuleDef>(GetLoadedModules());
 			ShowNoSelectionMessage();
 		}
 
@@ -145,10 +160,11 @@ namespace dnSpy.CallGraph {
 					snippet_cache.Remove(key);
 			}
 			bool affects_current_index = current_index?.Modules.Any(modified.Contains) == true ||
+				(current_root is not null && graph_modules?.Any(modified.Contains) == true) ||
 				(current_root?.Module is ModuleDef root_module && modified.Contains(root_module));
 			if (!affects_current_index)
 				return;
-			operation_cancellation?.Cancel();
+			CancelCurrentWork();
 			current_index = null;
 			current_index_covers_all_loaded_modules = false;
 			SetBusy(true, UiText.ModuleChanged);
@@ -164,6 +180,9 @@ namespace dnSpy.CallGraph {
 			if (disposed)
 				return;
 			var loaded_modules = new HashSet<ModuleDef>(GetLoadedModules());
+			if (observed_modules.SetEquals(loaded_modules)) return;
+			observed_modules = loaded_modules;
+			PruneHistory(loaded_modules);
 			index_cache.RemoveMissing(loaded_modules);
 			lock (snippet_cache) {
 				foreach (var key in snippet_cache.Keys.Where(key => key.Definition.Module is not ModuleDef module || !loaded_modules.Contains(module)).ToArray())
@@ -176,12 +195,9 @@ namespace dnSpy.CallGraph {
 			}
 			current_index = null;
 			current_index_covers_all_loaded_modules = false;
-			operation_cancellation?.Cancel();
+			CancelCurrentWork();
 			if (current_root?.Module is not ModuleDef root_module || !loaded_modules.Contains(root_module)) {
 				current_root = null;
-				history.RemoveAll(method => method.Module is ModuleDef module && !loaded_modules.Contains(module));
-				history_position = history.Count - 1;
-				UpdateHistoryButtons();
 				ShowNoSelectionMessage();
 				return;
 			}
@@ -215,7 +231,7 @@ namespace dnSpy.CallGraph {
 			DepthComboBox.SelectionChanged += ConfigurationChanged;
 			NodeLimitComboBox.SelectionChanged += ConfigurationChanged;
 			LanguageComboBox.SelectionChanged += ConfigurationChanged;
-			SearchTextBox.TextChanged += (_, __) => UpdateSearchResults();
+			SearchTextBox.TextChanged += (_, __) => UpdateSearchResults(true);
 			SearchTextBox.KeyDown += SearchTextBox_KeyDown;
 			SearchPreviousButton.Click += (_, __) => MoveSearch(-1);
 			SearchNextButton.Click += (_, __) => MoveSearch(+1);
@@ -245,7 +261,8 @@ namespace dnSpy.CallGraph {
 			UpdateSearchResults();
 		}
 
-		void UpdateSearchResults() {
+		void UpdateSearchResults(bool focus = false) {
+			var previous_match = search_position >= 0 && search_position < search_matches.Count ? search_matches[search_position] : null;
 			search_matches.Clear();
 			search_position = -1;
 			string query = SearchTextBox.Text.Trim();
@@ -254,13 +271,13 @@ namespace dnSpy.CallGraph {
 					CallGraphIndex.DisplayName(method).IndexOf(query, StringComparison.CurrentCultureIgnoreCase) >= 0 ||
 					CallGraphIndex.Signature(method).IndexOf(query, StringComparison.CurrentCultureIgnoreCase) >= 0));
 				if (search_matches.Count != 0)
-					search_position = 0;
+					search_position = Math.Max(0, search_matches.IndexOf(previous_match!));
 			}
 			bool has_query = query.Length != 0;
 			SearchPreviousButton.IsEnabled = SearchNextButton.IsEnabled = search_matches.Count != 0;
 			ClearSearchButton.IsEnabled = has_query;
 			SearchResultText.Text = has_query ? UiText.SearchResults(search_position + 1, search_matches.Count) : string.Empty;
-			if (search_position >= 0)
+			if (focus && search_position >= 0)
 				FocusSearchResult();
 		}
 
@@ -376,7 +393,13 @@ namespace dnSpy.CallGraph {
 		}
 
 		internal void ShowNoSelectionMessage() {
+			CancelCurrentWork();
+			document_change_timer.Stop();
+			current_root = null;
+			current_index = null;
+			current_index_covers_all_loaded_modules = false;
 			analyzing_graph = false; workspace_update_pending = false; graph_modules = null;
+			SetBusy(false, null);
 			GraphSurface.Clear(UiText.NoSelection);
 			FunctionMapSurface.Clear();
 			StatusText.Text = UiText.NoSelectionStatus;
@@ -400,9 +423,8 @@ namespace dnSpy.CallGraph {
 		void QueueRender() {
 			if (disposed || current_root is null)
 				return;
-			operation_cancellation?.Cancel();
-			visible_snippets_enabled = false;
-			preview_cancellation?.Cancel();
+			document_change_timer.Stop();
+			CancelCurrentWork();
 			operation_cancellation?.Dispose();
 			operation_cancellation = new CancellationTokenSource();
 			_ = RenderCurrentAsync(operation_cancellation.Token);
@@ -421,6 +443,7 @@ namespace dnSpy.CallGraph {
 					int block_limit = NodeLimitComboBox.SelectedItem is int selected_limit ? selected_limit : cfg_block_limit;
 					var cfg = await Task.Run(() => ControlFlowGraph.Build(root, block_limit, cancellation_token), cancellation_token);
 					cancellation_token.ThrowIfCancellationRequested();
+					if (!IsCurrent(cancellation_token)) return;
 					GraphSurface.Render(cfg, settings.EffectiveMaximumLines);
 					if (cfg.Blocks.Count == 0) { StatusText.Text = UiText.NoMethodBody; return; }
 					StatusText.Text = UiText.CfgStatus(CallGraphIndex.Signature(root), cfg.Blocks.Count, cfg.Edges.Count,
@@ -440,13 +463,15 @@ namespace dnSpy.CallGraph {
 				CallGraphSlice slice;
 				if (direction == CallGraphDirection.Callees) {
 					SetBusy(true, UiText.AnalyzingReachable);
+					bool show_preview = mode == GraphViewMode.FunctionMap ? !FunctionMapSurface.IsShowing(root) : !GraphSurface.IsShowing(root);
 					var progress = new Progress<CallGraphSlice>(preview => {
-						if (disposed || cancellation_token.IsCancellationRequested || !analyzing_graph || !ReferenceEquals(root, current_root) || mode != CurrentViewMode) return;
+						if (!show_preview || !IsCurrent(cancellation_token) || !analyzing_graph || !ReferenceEquals(root, current_root) || mode != CurrentViewMode) return;
 						if (mode == GraphViewMode.FunctionMap) FunctionMapSurface.Render(preview);
 						else GraphSurface.Render(preview, preview.Nodes.ToDictionary(node => node.Method, _ => HighlightedSnippet.Plain(UiText.AnalyzingReachable)));
 					});
 					var reachable = await Task.Run(() => CallGraphIndex.BuildReachableProgressive(root, modules, depth, node_limit, filters, progress, cancellation_token), cancellation_token);
 					cancellation_token.ThrowIfCancellationRequested();
+					if (!IsCurrent(cancellation_token)) return;
 					index = reachable.Index; slice = reachable.Slice;
 					current_index = index;
 					current_index_covers_all_loaded_modules = false;
@@ -455,7 +480,8 @@ namespace dnSpy.CallGraph {
 					if (index is null || index.IsReachableIndex || !current_index_covers_all_loaded_modules || !index.ContainsModule(root.Module)) {
 						var module_indexes = await GetOrBuildModuleIndexesAsync(modules, cancellation_token);
 						if (!index_cache.TryGetCombined(module_indexes, out index)) {
-							index = await Task.Run(() => CallGraphIndex.Combine(module_indexes), cancellation_token);
+							index = await Task.Run(() => CallGraphIndex.Combine(module_indexes, cancellation_token), cancellation_token);
+							cancellation_token.ThrowIfCancellationRequested();
 							index_cache.StoreCombined(module_indexes, index);
 						}
 						cancellation_token.ThrowIfCancellationRequested();
@@ -466,6 +492,7 @@ namespace dnSpy.CallGraph {
 					slice = await Task.Run(() => index.Select(root, direction, depth, node_limit, filters, cancellation_token), cancellation_token);
 				}
 				cancellation_token.ThrowIfCancellationRequested();
+				if (!IsCurrent(cancellation_token)) return;
 				StatusText.ToolTip = AnalysisDetails.StatusToolTip(slice);
 				if (mode == GraphViewMode.FunctionMap) {
 					FunctionMapSurface.Render(slice, index);
@@ -491,6 +518,7 @@ namespace dnSpy.CallGraph {
 			}
 			catch (OperationCanceledException) { }
 			catch (Exception ex) {
+				if (!IsCurrent(cancellation_token)) return;
 				if (CurrentViewMode == GraphViewMode.FunctionMap)
 					FunctionMapSurface.Clear();
 				else
@@ -498,7 +526,7 @@ namespace dnSpy.CallGraph {
 				StatusText.Text = UiText.GraphError(ex.Message);
 			}
 			finally {
-				if (!cancellation_token.IsCancellationRequested) {
+				if (IsCurrent(cancellation_token)) {
 					analyzing_graph = false;
 					SetBusy(false, null);
 					FlushWorkspaceUpdate();
@@ -509,6 +537,7 @@ namespace dnSpy.CallGraph {
 		void FlushWorkspaceUpdate() {
 			if (!workspace_update_pending || analyzing_graph || visible_snippets_running || disposed) return;
 			workspace_update_pending = false;
+			if (graph_modules is not null && graph_modules.SetEquals(GetLoadedModules())) return;
 			current_index = null; current_index_covers_all_loaded_modules = false;
 			document_change_timer.Stop(); document_change_timer.Start();
 		}
@@ -523,6 +552,7 @@ namespace dnSpy.CallGraph {
 			visible_snippets_requested = true;
 			if (visible_snippets_running) return;
 			visible_snippets_running = true;
+			visible_snippets_requested = false;
 			var token = operation_cancellation?.Token ?? CancellationToken.None;
 			try {
 				var decompiler = FindDecompiler(LanguageComboBox.SelectedIndex == 1 ? DecompilerConstants.LANGUAGE_IL : DecompilerConstants.LANGUAGE_CSHARP);
@@ -548,6 +578,7 @@ namespace dnSpy.CallGraph {
 						return result;
 					}, token);
 					token.ThrowIfCancellationRequested();
+					if (!IsCurrent(token)) return;
 					lock (snippet_cache)
 						foreach (var pair in snippets) snippet_cache[new SnippetCacheKey(pair.Key, decompiler.GenericGuid, maximum_lines)] = pair.Value;
 					GraphSurface.UpdateSnippets(snippets);
@@ -555,7 +586,12 @@ namespace dnSpy.CallGraph {
 				}
 			}
 			catch (OperationCanceledException) { }
-			catch (Exception ex) { if (!disposed) StatusText.Text = UiText.GraphError(ex.Message); }
+			catch (Exception ex) {
+				if (IsCurrent(token)) {
+					visible_snippets_enabled = visible_snippets_requested = false;
+					StatusText.Text = UiText.GraphError(ex.Message);
+				}
+			}
 			finally {
 				visible_snippets_running = false;
 				FlushWorkspaceUpdate();
@@ -621,26 +657,28 @@ namespace dnSpy.CallGraph {
 			preview_cancellation?.Dispose();
 			preview_cancellation = new CancellationTokenSource();
 			var cancellation_token = preview_cancellation.Token;
-			Guid language_guid = LanguageComboBox.SelectedIndex == 1
-				? DecompilerConstants.LANGUAGE_IL
-				: DecompilerConstants.LANGUAGE_CSHARP;
-			var decompiler = FindDecompiler(language_guid);
-			if (decompiler is null)
-				return;
-			const int preview_lines = 24;
-			var key = new SnippetCacheKey(method, decompiler.GenericGuid, preview_lines);
-			HighlightedSnippet? snippet;
-			lock (snippet_cache) {
-				snippet_cache.TryGetValue(key, out snippet);
-				if (snippet is null)
-					snippet = snippet_cache
-						.Where(pair => ReferenceEquals(pair.Key.Definition, method) && pair.Key.Language == decompiler.GenericGuid)
-						.Select(pair => pair.Value.LimitLines(preview_lines))
-						.FirstOrDefault();
-			}
 			try {
+				Guid language_guid = LanguageComboBox.SelectedIndex == 1
+					? DecompilerConstants.LANGUAGE_IL
+					: DecompilerConstants.LANGUAGE_CSHARP;
+				var decompiler = FindDecompiler(language_guid);
+				if (decompiler is null)
+					return;
+				const int preview_lines = 24;
+				var key = new SnippetCacheKey(method, decompiler.GenericGuid, preview_lines);
+				HighlightedSnippet? snippet;
+				lock (snippet_cache) {
+					snippet_cache.TryGetValue(key, out snippet);
+					if (snippet is null)
+						snippet = snippet_cache
+							.Where(pair => ReferenceEquals(pair.Key.Definition, method) && pair.Key.Language == decompiler.GenericGuid)
+							.Select(pair => pair.Value.LimitLines(preview_lines))
+							.FirstOrDefault();
+				}
 				if (snippet is null) {
 					snippet = await Task.Run(() => Decompile(method, decompiler, preview_lines, cancellation_token), cancellation_token);
+					cancellation_token.ThrowIfCancellationRequested();
+					if (disposed) return;
 					lock (snippet_cache)
 						snippet_cache[key] = snippet;
 				}
@@ -650,7 +688,8 @@ namespace dnSpy.CallGraph {
 			}
 			catch (OperationCanceledException) { }
 			catch (Exception ex) {
-				if (!disposed) FunctionMapSurface.SetCodePreview(method, HighlightedSnippet.Plain(ex.Message, dnSpy.Contracts.Text.TextColor.Error));
+				if (!disposed && !cancellation_token.IsCancellationRequested && CurrentViewMode == GraphViewMode.FunctionMap)
+					FunctionMapSurface.SetCodePreview(method, HighlightedSnippet.Plain(ex.Message, dnSpy.Contracts.Text.TextColor.Error));
 			}
 		}
 
@@ -762,6 +801,7 @@ namespace dnSpy.CallGraph {
 		}
 
 		void NavigateHistory(int delta) {
+			PruneHistory(new HashSet<ModuleDef>(GetLoadedModules()));
 			int next = history_position + delta;
 			if (next < 0 || next >= history.Count)
 				return;
@@ -778,6 +818,18 @@ namespace dnSpy.CallGraph {
 		void UpdateHistoryButtons() {
 			BackButton.IsEnabled = history_position > 0;
 			ForwardButton.IsEnabled = history_position >= 0 && history_position + 1 < history.Count;
+		}
+
+		void PruneHistory(ISet<ModuleDef> loaded_modules) {
+			int position = -1;
+			var retained = new List<MethodDef>();
+			for (int index = 0; index < history.Count; index++) {
+				if (history[index].Module is not ModuleDef module || !loaded_modules.Contains(module)) continue;
+				retained.Add(history[index]);
+				if (index <= history_position) position = retained.Count - 1;
+			}
+			history.Clear(); history.AddRange(retained); history_position = position;
+			UpdateHistoryButtons();
 		}
 
 		void SetBusy(bool busy, string? message) {

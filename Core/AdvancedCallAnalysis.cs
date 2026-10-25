@@ -268,6 +268,9 @@ namespace dnSpy.CallGraph.Core {
 		public bool PathTerminated { get; set; }
 		public bool ConservativeContext { get; set; }
 		public ImmutableHashSet<object> EscapedStorage { get; set; } = ImmutableHashSet<object>.Empty;
+		public ImmutableHashSet<TypeDef> InitializedTypes { get; set; } = ImmutableHashSet<TypeDef>.Empty;
+		public ImmutableHashSet<TypeDef> InitializingTypes { get; set; } = ImmutableHashSet<TypeDef>.Empty;
+		public ImmutableHashSet<TypeDef> FailedInitializers { get; set; } = ImmutableHashSet<TypeDef>.Empty;
 		ImmutableHashSet<object> byte_addressed_storage = ImmutableHashSet<object>.Empty;
 		public void Store(object address, SymbolicValue value) {
 			if (address is FlowAddress { Kind: "aggregate member" } member) {
@@ -302,6 +305,9 @@ namespace dnSpy.CallGraph.Core {
 			foreach (var key in Memory.Where(pair => ReferenceEquals(pair.Value, tested)).Select(pair => pair.Key).ToArray()) Store(key, value);
 		}
 		public void ImportMemory(SymbolicState other) {
+			InitializedTypes = other.InitializedTypes;
+			InitializingTypes = other.InitializingTypes;
+			FailedInitializers = other.FailedInitializers;
 			EscapedStorage = other.EscapedStorage;
 			byte_addressed_storage = other.byte_addressed_storage;
 			Memory = other.Memory;
@@ -323,12 +329,18 @@ namespace dnSpy.CallGraph.Core {
 			var result = new SymbolicState(new List<SymbolicValue>(Stack), new Dictionary<int, SymbolicValue>(Locals)) { Frame = Frame, MemoryStamp = MemoryStamp, HasWrites = HasWrites, FinallyTargets = FinallyTargets, ExceptionalPath = ExceptionalPath, PendingException = PendingException, PathTerminated = PathTerminated, ConservativeContext = ConservativeContext, EscapedStorage = EscapedStorage };
 			foreach (var pair in Arguments) result.Arguments[pair.Key] = pair.Value;
 			result.Memory = Memory;
+			result.InitializedTypes = InitializedTypes;
+			result.InitializingTypes = InitializingTypes;
+			result.FailedInitializers = FailedInitializers;
 			result.byte_addressed_storage = byte_addressed_storage;
 			return result;
 		}
 
 		public bool MergeFrom(SymbolicState other) {
 			bool changed = false;
+			if (!InitializedTypes.IsSubsetOf(other.InitializedTypes)) { InitializedTypes = InitializedTypes.Intersect(other.InitializedTypes); changed = true; }
+			if (!InitializingTypes.IsSubsetOf(other.InitializingTypes)) { InitializingTypes = InitializingTypes.Intersect(other.InitializingTypes); changed = true; }
+			if (!FailedInitializers.IsSubsetOf(other.FailedInitializers)) { FailedInitializers = FailedInitializers.Intersect(other.FailedInitializers); changed = true; }
 			if (!other.byte_addressed_storage.IsSubsetOf(byte_addressed_storage)) { byte_addressed_storage = byte_addressed_storage.Union(other.byte_addressed_storage); changed = true; }
 			if (!other.EscapedStorage.IsSubsetOf(EscapedStorage)) { EscapedStorage = EscapedStorage.Union(other.EscapedStorage); changed = true; }
 			if (other.ConservativeContext && !ConservativeContext) { ConservativeContext = true; changed = true; }
@@ -483,6 +495,17 @@ namespace dnSpy.CallGraph.Core {
 			if (declaration.DeclaringType is not TypeDef declaring_type)
 				return result;
 			bool is_interface = declaring_type.IsInterface;
+			if (is_interface) {
+				TypeDef? ResolveType(ITypeDefOrRef? reference) {
+					var matches = ResolveTypes(reference, type_map).Take(2).ToArray();
+					return matches.Length == 1 ? matches[0] : null;
+				}
+				foreach (var type in type_map.Values.SelectMany(values => values)) {
+					if (!ImplementsInterface(type, declaring_type, type_map)) continue;
+					if (VirtualDispatchResolver.Resolve(declaration, type, ResolveType) is MethodDef target && IsRuntimeMethod(target)) result.Add(target);
+				}
+				return result;
+			}
 			if (signature_map.TryGetValue(MethodSignatureKey(declaration), out var candidates)) {
 				foreach (var candidate in candidates) {
 					if (ReferenceEquals(candidate, declaration) || !IsRuntimeMethod(candidate) ||

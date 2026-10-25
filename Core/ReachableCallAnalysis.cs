@@ -32,6 +32,11 @@ namespace dnSpy.CallGraph.Core {
 		readonly Dictionary<IMethod, MethodDef?> resolved = new Dictionary<IMethod, MethodDef?>();
 		readonly PointerFlowCatalog storage = new PointerFlowCatalog();
 		readonly HashSet<TypeDef> initialized = new HashSet<TypeDef>();
+		readonly Dictionary<TypeDef, MethodDef?> type_initializers = new Dictionary<TypeDef, MethodDef?>();
+		MethodDef? TypeInitializer(TypeDef type) {
+			if (!type_initializers.TryGetValue(type, out var method)) type_initializers[type] = method = type.FindStaticConstructor();
+			return method;
+		}
 		readonly ContextCallEvaluator evaluator;
 		readonly MethodFlowRunner runner;
 		readonly InvocationModel invocations;
@@ -45,6 +50,14 @@ namespace dnSpy.CallGraph.Core {
 		readonly Dictionary<MethodDef, HashSet<uint>> indirect_sites = new Dictionary<MethodDef, HashSet<uint>>();
 		readonly Dictionary<MethodDef, HashSet<uint>> resolved_sites = new Dictionary<MethodDef, HashSet<uint>>();
 		readonly HashSet<(MethodDef Method, uint Offset)> unknown_sites = new HashSet<(MethodDef, uint)>();
+		internal IReadOnlyDictionary<MethodDef, uint[]> UnresolvedIndirectSites => unknown_sites.GroupBy(site => site.Method)
+			.ToDictionary(group => group.Key, group => group.Select(site => site.Offset).OrderBy(offset => offset).ToArray());
+		void RecordIndirectSites(MethodDef method, Trace trace) {
+			if (!indirect_sites.TryGetValue(method, out var indirect)) indirect_sites[method] = indirect = new HashSet<uint>();
+			if (!resolved_sites.TryGetValue(method, out var known)) resolved_sites[method] = known = new HashSet<uint>();
+			indirect.UnionWith(trace.IndirectSites); known.UnionWith(trace.ResolvedSites);
+			foreach (uint offset in trace.UnresolvedSites) unknown_sites.Add((method, offset));
+		}
 		readonly Dictionary<MethodDef, MethodDef[]> virtual_targets = new Dictionary<MethodDef, MethodDef[]>();
 		readonly HashSet<IMethod> fallback_attempted = new HashSet<IMethod>();
 		Dictionary<string, TypeDef[]>? loaded_types;
@@ -72,6 +85,8 @@ namespace dnSpy.CallGraph.Core {
 			evaluator.ConsumeStep = ConsumeHelperStep;
 			evaluator.RequestBudget = requested => helper_budget = Math.Max(helper_budget, requested);
 			evaluator.CanAnalyze = method => this.modules.Contains(method.Module);
+			evaluator.BeforeInstruction = (method, instruction, state) => InitializeForInstruction(method, instruction, state, null);
+			evaluator.BeforeMethod = (method, state) => InitializeForMethod(method, state, null, null);
 		}
 		bool ConsumeStep() => --remaining_steps >= 0 && ++method_steps <= method_budget;
 		bool ConsumeHelperStep() => --remaining_helper_steps >= 0 && ++helper_steps <= helper_budget;
@@ -80,11 +95,12 @@ namespace dnSpy.CallGraph.Core {
 			remaining_steps = int.MaxValue;
 			remaining_helper_steps = int.MaxValue;
 			int skipped = 0;
-			foreach (var method in methods) {
+			foreach (var method in OrderForScan(methods)) {
 				cancellation_token.ThrowIfCancellationRequested();
 				if (!method.HasBody || !NeedsFlow(method)) continue;
 				try {
 					var trace = Walk(method, UnknownArguments(method), new SymbolicState());
+					RecordIndirectSites(method, trace);
 					foreach (var call in trace.Calls) CallGraphIndex.AddCallSite(result, method, call.Target, call.Instruction.Offset, call.Operation, call.Potential);
 				}
 				catch (OperationCanceledException) { throw; }
@@ -93,7 +109,31 @@ namespace dnSpy.CallGraph.Core {
 			virtual_calls.AddRange(virtual_sites); reflection_calls.AddRange(reflection_sites);
 			return skipped;
 		}
-		internal static bool NeedsFlow(MethodDef method) => method.Body.ExceptionHandlers.Count != 0 || method.Body.Instructions.Any(instruction => instruction.OpCode.Code is Code.Callvirt or Code.Calli or Code.Ldftn or Code.Ldvirtftn ||
+
+		IEnumerable<MethodDef> OrderForScan(IReadOnlyList<MethodDef> methods) {
+			var available = new HashSet<MethodDef>(methods);
+			var visited = new HashSet<MethodDef>();
+			var pending = new Stack<(MethodDef Method, bool Exit)>();
+			foreach (var seed in methods) {
+				pending.Push((seed, false));
+				while (pending.Count != 0) {
+					cancellation_token.ThrowIfCancellationRequested();
+					var current = pending.Pop();
+					if (current.Exit) { yield return current.Method; continue; }
+					if (!visited.Add(current.Method)) continue;
+					pending.Push((current.Method, true));
+					if (!current.Method.HasBody || current.Method.Body.Instructions.Count > 200000) continue;
+					int position = 0;
+					foreach (var instruction in current.Method.Body.Instructions) {
+						if ((position++ & 255) == 0) cancellation_token.ThrowIfCancellationRequested();
+						if (instruction.OpCode.Code is not Code.Call and not Code.Newobj || instruction.Operand is not IMethod reference) continue;
+						if (Resolve(reference) is MethodDef target && available.Contains(target) && !visited.Contains(target)) pending.Push((target, false));
+					}
+				}
+			}
+		}
+		internal static bool NeedsFlow(MethodDef method) => method.Body.ExceptionHandlers.Count != 0 || method.Body.Instructions.Any(instruction => MethodFlowRunner.MayThrow(instruction) || instruction.OpCode.FlowControl == FlowControl.Cond_Branch ||
+			instruction.OpCode.Code is Code.Callvirt or Code.Calli or Code.Ldftn or Code.Ldvirtftn or Code.Div or Code.Div_Un or Code.Rem or Code.Rem_Un ||
 			instruction.Operand is IMethod reference && (reference.Name == "Invoke" || reference.Name == "DynamicInvoke" ||
 				CallGraphIndex.SafeTypeName(reference.DeclaringType).StartsWith("System.Runtime.CompilerServices.Async", StringComparison.Ordinal) ||
 				CallGraphIndex.SafeTypeName(reference.DeclaringType).StartsWith("System.Threading", StringComparison.Ordinal)));
@@ -117,7 +157,7 @@ namespace dnSpy.CallGraph.Core {
 		SymbolicValue FieldValue(FieldDef? field) {
 			if (field?.Constant?.Value is int literal) return SymbolicValue.FromInteger(evaluator.Integers.Constant(literal));
 			if (field?.DeclaringType is TypeDef type && modules.Contains(type.Module) && initialized.Add(type)) {
-				var initializer = type.FindStaticConstructor();
+				var initializer = TypeInitializer(type);
 				if (initial_state_known || initializer?.HasBody == true) foreach (var item in type.Fields.Where(item => item.IsStatic && !item.IsLiteral)) storage.MergeField(item, SymbolicValue.FromInteger(evaluator.Integers.Constant(0, item.FieldSig?.Type.ElementType is ElementType.I8 or ElementType.U8)));
 				if (initializer?.HasBody == true) {
 					var state = new SymbolicState();
@@ -131,6 +171,52 @@ namespace dnSpy.CallGraph.Core {
 				value = InferField(field); if (!value.IsUnknown) storage.SetField(field, value);
 			}
 			return value;
+		}
+
+		void InitializeForMethod(MethodDef method, SymbolicState state, Trace? trace, Instruction? site) {
+			if (method.IsStaticConstructor) return;
+			var type = method.DeclaringType;
+			if (!type.IsBeforeFieldInit && (method.IsStatic || method.IsInstanceConstructor || type.IsValueType))
+				EnsureInitialized(method, type, site, state, trace);
+		}
+
+		void InitializeForInstruction(MethodDef method, Instruction instruction, SymbolicState state, Trace? trace) {
+			var code = instruction.OpCode.Code;
+			if (code is Code.Ldsfld or Code.Ldsflda or Code.Stsfld && instruction.Operand is IField field_reference) {
+				var field = storage.ResolveField(field_reference);
+				if (field?.DeclaringType is TypeDef type && !field.IsLiteral) EnsureInitialized(method, type, instruction, state, trace);
+			}
+			else if (code is Code.Call or Code.Callvirt or Code.Newobj or Code.Jmp && instruction.Operand is IMethod reference && Resolve(reference) is MethodDef target) {
+				if (target.IsStaticConstructor || target.DeclaringType.IsBeforeFieldInit) return;
+				if (target.IsStatic || code == Code.Newobj || target.DeclaringType.IsValueType)
+					EnsureInitialized(method, target.DeclaringType, instruction, state, trace);
+			}
+		}
+
+		void EnsureInitialized(MethodDef source, TypeDef type, Instruction? site, SymbolicState state, Trace? trace) {
+			if (!modules.Contains(type.Module) || state.InitializedTypes.Contains(type) || state.InitializingTypes.Contains(type)) return;
+			if (state.FailedInitializers.Contains(type)) { state.PathTerminated = true; return; }
+			var initializer = TypeInitializer(type);
+			if (initializer is null) { state.InitializedTypes = state.InitializedTypes.Add(type); return; }
+			if (state.InitializingTypes.Count >= 32) {
+				incomplete = true; state.ConservativeContext = true;
+				Report(source, site?.Offset ?? 0, GraphDiagnosticKind.AnalysisBudget, "type initialization nesting limit reached"); return;
+			}
+			initialized.Add(type);
+			foreach (var field in type.Fields.Where(field => field.IsStatic && !field.IsLiteral))
+				if (!state.Memory.ContainsKey(field)) state.Store(field, SymbolicValue.FromInteger(evaluator.Integers.Constant(0, field.FieldSig?.Type.ElementType is ElementType.I8 or ElementType.U8)));
+			state.InitializingTypes = state.InitializingTypes.Add(type);
+			var instruction = site ?? source.Body?.Instructions.FirstOrDefault() ?? Instruction.Create(OpCodes.Nop);
+			trace?.Calls.Add(new Call(instruction, initializer, Array.Empty<SymbolicValue>(), state,
+				!initial_state_known || type.IsBeforeFieldInit, "type initializer"));
+			bool conservative = state.ConservativeContext;
+			var initialization = new SymbolicState(); initialization.ImportMemory(state); initialization.ConservativeContext = false;
+			evaluator.Evaluate(initializer, Array.Empty<SymbolicValue>(), initialization, instruction);
+			state.ImportMemory(initialization); state.PathTerminated = initialization.PathTerminated;
+			if (conservative) ContextCallEvaluator.InvalidateUnknownCall(state, Array.Empty<SymbolicValue>());
+			state.InitializingTypes = state.InitializingTypes.Remove(type);
+			if (state.PathTerminated) state.FailedInitializers = state.FailedInitializers.Add(type);
+			else state.InitializedTypes = state.InitializedTypes.Add(type);
 		}
 		SymbolicValue InferField(FieldDef field) {
 			var element = field.FieldSig?.Type.ElementType;
@@ -166,6 +252,7 @@ namespace dnSpy.CallGraph.Core {
 			limit = Math.Max(2, limit);
 			var layers = new Dictionary<MethodDef, int> { [root] = 0 };
 			var contexts = new HashSet<string>();
+			var deferred = new Dictionary<(MethodDef Source, MethodDef Target), List<(Call Call, int Depth)>>();
 			var queue = new Queue<(MethodDef Method, SymbolicValue[] Arguments, int Depth, SymbolicState Memory)>();
 			queue.Enqueue((root, UnknownArguments(root), 0, new SymbolicState()));
 			bool truncated = false;
@@ -173,7 +260,7 @@ namespace dnSpy.CallGraph.Core {
 			while (queue.Count != 0) {
 				cancellation_token.ThrowIfCancellationRequested();
 				var current = queue.Dequeue();
-				if (current.Depth >= depth || !modules.Contains(current.Method.Module)) continue;
+				if (!modules.Contains(current.Method.Module)) continue;
 				if (!contexts.Add(evaluator.ContextKey(current.Method, current.Arguments, current.Memory))) continue;
 				if (contexts.Count > 8000) { incomplete = true; Report(current.Method, 0, GraphDiagnosticKind.AnalysisBudget, "graph context limit reached"); break; }
 				Trace trace;
@@ -182,21 +269,30 @@ namespace dnSpy.CallGraph.Core {
 				}
 				catch (OperationCanceledException) { throw; }
 				catch (Exception error) { incomplete = true; Report(current.Method, 0, GraphDiagnosticKind.UnresolvedReference, error.GetType().Name + ": " + error.Message); continue; }
-				if (!indirect_sites.TryGetValue(current.Method, out var indirect)) indirect_sites[current.Method] = indirect = new HashSet<uint>();
-				if (!resolved_sites.TryGetValue(current.Method, out var known)) resolved_sites[current.Method] = known = new HashSet<uint>();
-				indirect.UnionWith(trace.IndirectSites); known.UnionWith(trace.ResolvedSites);
-				foreach (uint offset in trace.UnresolvedSites) unknown_sites.Add((current.Method, offset));
+				if (current.Depth >= depth) {
+					if (trace.Calls.Any(call => !layers.ContainsKey(call.Target) && filter.Includes(root, call.Target))) {
+						truncated = true;
+						Report(current.Method, 0, GraphDiagnosticKind.AnalysisBudget, "graph depth limit reached; outgoing calls are not displayed");
+					}
+					continue;
+				}
+				RecordIndirectSites(current.Method, trace);
 				foreach (var call in trace.Calls)
 					CallGraphIndex.AddCallSite(call_sites, current.Method, call.Target, call.Instruction.Offset,
 						call.Operation, call.Potential);
 				foreach (var call in trace.Calls) {
 					var accumulator = call_sites[(current.Method, call.Target)];
-					if (accumulator.Count < filter.MinimumCallSiteCount || !filter.Includes(root, call.Target)) continue;
+					if (!filter.Includes(root, call.Target)) continue;
+					var key = (current.Method, call.Target);
+					if (!deferred.TryGetValue(key, out var pending)) deferred[key] = pending = new List<(Call, int)>();
+					pending.Add((call, current.Depth + 1));
+					if (accumulator.Count < filter.MinimumCallSiteCount) continue;
 					if (!layers.ContainsKey(call.Target)) {
 						if (layers.Count >= limit) { truncated = true; continue; }
 						layers.Add(call.Target, current.Depth + 1);
 					}
-					queue.Enqueue((call.Target, call.Arguments, current.Depth + 1, call.Memory));
+					foreach (var item in pending) queue.Enqueue((item.Call.Target, item.Call.Arguments, item.Depth, item.Call.Memory));
+					pending.Clear();
 				}
 				if (!preview_sent && progress is not null) { preview_sent = true; progress.Report(Snapshot(root, layers, filter, true)); }
 			}
@@ -230,8 +326,13 @@ namespace dnSpy.CallGraph.Core {
 			helper_steps = 0; helper_budget = method_budget;
 			string scope = evaluator.ContextKey(method, arguments);
 			var initial = new SymbolicState { Frame = new FlowAddress("frame", method, scope) }; initial.ImportMemory(memory);
+			if (method.IsStaticConstructor) initial.InitializingTypes = initial.InitializingTypes.Add(method.DeclaringType);
 			for (int index = 0; index < arguments.Count; index++) initial.Arguments[index] = arguments[index];
+			InitializeForMethod(method, initial, trace, null);
+			if (initial.PathTerminated) return trace;
 			var result = runner.Run(method, initial, (instruction, state) => {
+				InitializeForInstruction(method, instruction, state, trace);
+				if (state.PathTerminated) return;
 				trace.Reached.Add(instruction.Offset);
 				var code = instruction.OpCode.Code;
 				if (code is Code.Ldftn or Code.Ldvirtftn && instruction.Operand is IMethod pointer && Resolve(pointer) is MethodDef referenced) Report(method, instruction.Offset, GraphDiagnosticKind.AddressReference, code == Code.Ldftn ? "ldftn" : "ldvirtftn", referenced);

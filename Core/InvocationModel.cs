@@ -44,26 +44,7 @@ namespace dnSpy.CallGraph.Core {
 			receiver = FlowMemory.ReadObject(state, receiver);
 			if (!receiver.IsExactType || receiver.TypeNames.Count != 1 || Type(receiver.TypeNames.Single()) is not TypeDef type) return null;
 			if (dispatch_cache.TryGetValue((declaration, type), out var cached)) return cached;
-			var relations = new Queue<TypeDef>(); var related_types = new HashSet<TypeDef>(); relations.Enqueue(type);
-			while (relations.Count != 0) {
-				var current = relations.Dequeue(); if (!related_types.Add(current)) continue;
-				if (ResolveType(current.BaseType) is TypeDef parent) relations.Enqueue(parent);
-				foreach (var implementation in current.Interfaces) if (ResolveType(implementation.Interface) is TypeDef implemented) relations.Enqueue(implemented);
-			}
-			if (!related_types.Contains(declaration.DeclaringType)) return dispatch_cache[(declaration, type)] = null;
-			MethodDef? result = null;
-			var visited = new HashSet<TypeDef>();
-			bool member_of_type = false;
-			for (var current = type; current is not null && visited.Add(current); current = ResolveType(current.BaseType)) {
-				if (ReferenceEquals(current, declaration.DeclaringType)) member_of_type = true;
-				var explicit_method = current.Methods.FirstOrDefault(candidate => candidate.Overrides.Any(item => SameMethod(item.MethodDeclaration, declaration)));
-				if (explicit_method is not null) { result = explicit_method; break; }
-				var match = current.Methods.FirstOrDefault(candidate => candidate.Name == declaration.Name && !candidate.IsStatic &&
-					new SigComparer().Equals(candidate.MethodSig, declaration.MethodSig) && (declaration.DeclaringType.IsInterface || candidate.IsVirtual && !candidate.IsNewSlot || ReferenceEquals(candidate, declaration)));
-				if (match is not null) { result = match; break; }
-			}
-			if (result is null && member_of_type && !declaration.IsAbstract) result = declaration;
-			return dispatch_cache[(declaration, type)] = result;
+			return dispatch_cache[(declaration, type)] = VirtualDispatchResolver.Resolve(declaration, type, ResolveType);
 		}
 		public MethodDef? DispatchReference(IMethod reference, SymbolicValue receiver, SymbolicState state) {
 			var declaration = resolve(reference);

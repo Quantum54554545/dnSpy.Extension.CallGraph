@@ -85,6 +85,7 @@ namespace dnSpy.CallGraph.Controls {
 		bool dragging;
 		bool geometry_update_pending;
 		MouseButton drag_button;
+		Action? pending_render;
 
 		public event EventHandler<GraphReferenceEventArgs>? RootRequested;
 		public event EventHandler<GraphReferenceEventArgs>? NavigateRequested;
@@ -111,8 +112,14 @@ namespace dnSpy.CallGraph.Controls {
 		protected override Size ArrangeOverride(Size finalSize) { graph_visual.Arrange(new Rect(0, 0, 1, 1)); return finalSize; }
 
 		internal void SetThemeService(IThemeService value) => theme_service = value;
+		internal bool IsShowing(MethodDef method) => ReferenceEquals(root, method);
+		internal void CancelPendingRender() => pending_render = null;
 
 		public void Clear() {
+			pending_render = null;
+			drag_candidate = dragging = false;
+			if (IsMouseCaptured) ReleaseMouseCapture();
+			Cursor = Cursors.Arrow;
 			slice = null;
 			index = null;
 			root = hovered = selected = null;
@@ -134,10 +141,22 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		public void Render(CallGraphSlice value, CallGraphIndex? graph_index = null) {
+			if (drag_candidate) {
+				pending_render = () => Render(value, graph_index);
+				return;
+			}
+			var next_root = value.Nodes.FirstOrDefault(node => node.IsRoot)?.Method;
+			bool preserve = root is not null && ReferenceEquals(root, next_root);
+			var previous_positions = preserve ? new Dictionary<MethodDef, Point>(positions) : null;
+			var previous_selected = selected;
+			drag_candidate = dragging = false;
+			dragged_method = null;
+			if (IsMouseCaptured) ReleaseMouseCapture();
+			Cursor = Cursors.Arrow;
 			slice = value;
 			index = graph_index;
-			root = value.Nodes.FirstOrDefault(node => node.IsRoot)?.Method;
-			selected = root;
+			root = next_root;
+			selected = preserve && value.Nodes.Any(node => ReferenceEquals(node.Method, previous_selected)) ? previous_selected : root;
 			hovered = null;
 			HideCodePreview();
 			incident_links.Clear();
@@ -149,8 +168,13 @@ namespace dnSpy.CallGraph.Controls {
 				incoming.Add(link);
 			}
 			BuildLayout();
+			if (previous_positions is not null) {
+				foreach (var pair in previous_positions)
+					if (positions.ContainsKey(pair.Key)) positions[pair.Key] = pair.Value;
+				RebuildHitIndex();
+			}
 			BuildGeometry();
-			ResetView();
+			if (!preserve) ResetView(); else InvalidateVisual();
 		}
 
 		public void ResetView() {
@@ -759,12 +783,14 @@ namespace dnSpy.CallGraph.Controls {
 
 		protected override void OnLostMouseCapture(MouseEventArgs e) {
 			base.OnLostMouseCapture(e);
+			bool had_drag = drag_candidate || dragging;
 			bool rebuild = dragging && dragged_method is not null;
 			drag_candidate = dragging = false;
 			dragged_method = null;
 			geometry_timer.Stop(); geometry_update_pending = false;
 			if (rebuild && slice is not null) { BuildGeometry(); InvalidateVisual(); }
 			Cursor = Cursors.Arrow;
+			if (had_drag) ApplyPendingRender();
 		}
 
 		protected override void OnMouseLeave(MouseEventArgs e) {
@@ -804,6 +830,13 @@ namespace dnSpy.CallGraph.Controls {
 			}
 			else
 				ShowCodePreview();
+			ApplyPendingRender();
+		}
+
+		void ApplyPendingRender() {
+			var pending = pending_render;
+			pending_render = null;
+			pending?.Invoke();
 		}
 
 		void OpenContextMenu(MethodDef method) {

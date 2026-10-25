@@ -29,6 +29,8 @@ namespace dnSpy.CallGraph.Core {
 		readonly Dictionary<(MethodDef, string, object?), object> frames = new Dictionary<(MethodDef, string, object?), object>();
 		readonly Dictionary<MethodDef, HashSet<FieldDef>> read_fields = new Dictionary<MethodDef, HashSet<FieldDef>>();
 		internal Action<MethodDef, long>? EvaluationCompleted { get; set; }
+		internal Action<MethodDef, Instruction, SymbolicState>? BeforeInstruction { get; set; }
+		internal Action<MethodDef, SymbolicState>? BeforeMethod { get; set; }
 		int remaining_steps;
 		int next_identity;
 		public IntegerExpression.Factory Integers { get; } = new IntegerExpression.Factory();
@@ -61,7 +63,7 @@ namespace dnSpy.CallGraph.Core {
 			":r" + (value.Receiver is null ? 0 : Identity(value.Receiver)) + ":p" + string.Join(",", value.PointerSignatures.SelectMany(pair => pair.Value).Select(signature => signature.ToString())) + ":a" + (value.OpaqueIdentity is null ? 0 : Identity(value.OpaqueIdentity)) + ":d" + string.Join(",", value.DynamicNames) + ":" + value.IsUnknown + ":" + value.IsAmbiguous + ":" + value.IsBoxed + ":" + value.IsExactType + ":" + value.MayHaveUnknownTargets + ":" + value.MayBeNull + ":kind:" + value.MethodKind + ":members:" + string.Join(";", value.Members.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => pair.Key + "=" + ArgumentKey(pair.Value)));
 		internal string ContextKey(MethodDef method, IReadOnlyList<SymbolicValue> arguments) => Identity(method) + ":" + string.Join(";", arguments.Select(ArgumentKey));
 		internal string ContextKey(MethodDef method, IReadOnlyList<SymbolicValue> arguments, SymbolicState memory) {
-			string key = ContextKey(method, arguments) + ":conservative:" + memory.ConservativeContext;
+			string key = ContextKey(method, arguments) + ":conservative:" + memory.ConservativeContext + InitializationKey(memory);
 			if (memory.Memory.IsEmpty) return key;
 			if (!read_fields.TryGetValue(method, out var fields)) {
 				fields = new HashSet<FieldDef>(); var pending = new Queue<MethodDef>(); var visited = new HashSet<MethodDef>(); pending.Enqueue(method);
@@ -95,6 +97,10 @@ namespace dnSpy.CallGraph.Core {
 		}
 
 		public SymbolicValue Evaluate(MethodDef method, IReadOnlyList<SymbolicValue> arguments, SymbolicState? caller = null, object? call_site = null) {
+			if (caller is not null) {
+				BeforeMethod?.Invoke(method, caller);
+				if (caller.PathTerminated) return SymbolicValue.UnknownBecause("type initialization failed");
+			}
 			if (CanAnalyze?.Invoke(method) == false) { if (caller is not null) InvalidateEffects(method, arguments, caller); return SymbolicValue.UnknownBecause("method body is outside the loaded workspace"); }
 			if (method.HasBody) RequestBudget?.Invoke(Math.Min(200000, method.Body.Instructions.Count * 2));
 			if (active.Count == 0) { remaining_steps = 120000; LastFailure = null; }
@@ -103,7 +109,7 @@ namespace dnSpy.CallGraph.Core {
 				if (caller is not null) InvalidateEffects(method, arguments, caller);
 				return SymbolicValue.UnknownBecause(LastFailure);
 			}
-			var key = (method, string.Join(";", arguments.Select(ArgumentKey)) + ":conservative:" + (caller?.ConservativeContext == true), caller is null || caller.Memory.IsEmpty ? null : caller.MemoryStamp);
+			var key = (method, string.Join(";", arguments.Select(ArgumentKey)) + ":conservative:" + (caller?.ConservativeContext == true) + (caller is null ? string.Empty : InitializationKey(caller)), caller is null || caller.Memory.IsEmpty ? null : caller.MemoryStamp);
 			if (cache.TryGetValue(key, out var cached)) return cached;
 			if (!active.Add(method)) { LastFailure = "recursive helper summary is not available"; if (caller is not null) InvalidateEffects(method, arguments, caller); return SymbolicValue.UnknownBecause(LastFailure); }
 			long started = EvaluationCompleted is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
@@ -122,8 +128,8 @@ namespace dnSpy.CallGraph.Core {
 					else if (!flow.Incomplete && flow.ExceptionExit is not null) { caller.ImportMemory(flow.ExceptionExit); caller.PathTerminated = true; }
 					else InvalidateEffects(method, arguments, caller);
 				}
-				if (!flow.Incomplete && flow.Exit is not null && ReferenceEquals(stamp, flow.Exit.MemoryStamp) && !result.IsAmbiguous && result.Storage is null && result.Receiver is null &&
-					(result.Methods.Count == 1 || result.Integer?.IsConstant == true) && cache.Count < 16000) cache[key] = result;
+				if (!flow.Incomplete && flow.Exit is not null && ReferenceEquals(stamp, flow.Exit.MemoryStamp) && state.InitializedTypes.SetEquals(flow.Exit.InitializedTypes) && !result.IsAmbiguous && result.Storage is null && result.Receiver is null &&
+					(result.Methods.Count == 1 || result.Integer?.IsConstant == true || !CallSignature.ReturnsValue(method.MethodSig) && flow.ExceptionExit is null) && cache.Count < 16000) cache[key] = result;
 				return result;
 			}
 			finally { active.Remove(method); if (EvaluationCompleted is not null) EvaluationCompleted(method, (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds); }
@@ -163,6 +169,8 @@ namespace dnSpy.CallGraph.Core {
 		MethodFlowResult Run(MethodDef method, IReadOnlyList<SymbolicValue> arguments, SymbolicState initial) {
 			string? unsupported = null;
 			var flow = runner.Run(method, initial, (instruction, state) => {
+				BeforeInstruction?.Invoke(method, instruction, state);
+				if (state.PathTerminated) return;
 				if (instruction.OpCode.Code == Code.Jmp && instruction.Operand is IMethod reference && Resolve(reference) is MethodDef target) { state.Stack.Add(Evaluate(target, arguments, state)); return; }
 				if (!Execute(method, instruction, state, arguments)) {
 					LastFailure = "unsupported IL operation: " + instruction.OpCode.Name;
@@ -174,6 +182,9 @@ namespace dnSpy.CallGraph.Core {
 			if (unsupported is not null) { flow.Incomplete = true; flow.Failure ??= unsupported; }
 			return flow;
 		}
+
+		string InitializationKey(SymbolicState state) => ":initialized:" + string.Join(",", state.InitializedTypes.Select(Identity).OrderBy(value => value)) +
+			":initializing:" + string.Join(",", state.InitializingTypes.Select(Identity).OrderBy(value => value)) + ":failed-init:" + string.Join(",", state.FailedInitializers.Select(Identity).OrderBy(value => value));
 
 		internal bool Execute(MethodDef method, Instruction instruction, SymbolicState state, IReadOnlyList<SymbolicValue> arguments) {
 			var code = instruction.OpCode.Code;
@@ -273,6 +284,13 @@ namespace dnSpy.CallGraph.Core {
 			case Code.Shl: case Code.Shr: case Code.Shr_Un: case Code.Div: case Code.Div_Un: case Code.Rem: case Code.Rem_Un:
 			case Code.Ceq: case Code.Cgt: case Code.Cgt_Un: case Code.Clt: case Code.Clt_Un: {
 				var right = Pop(state); var left = Pop(state);
+				if (code is Code.Div or Code.Div_Un or Code.Rem or Code.Rem_Un && !left.Floating.HasValue && !right.Floating.HasValue) {
+					bool zero_divisor = right.Integer?.IsZero == true;
+					bool signed_overflow = code == Code.Div && left.Integer?.IsConstant == true && right.Integer?.IsConstant == true &&
+						right.Integer.Value == -1 && (left.Integer.BitWidth == 64 && left.Integer.Value == long.MinValue ||
+						left.Integer.BitWidth == 32 && left.Integer.Value == int.MinValue);
+					if (zero_divisor || signed_overflow) { state.PathTerminated = true; return true; }
+				}
 				state.Stack.Add(Binary(code, left, right)); return true;
 			}
 			default: return false;

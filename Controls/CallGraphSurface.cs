@@ -108,6 +108,35 @@ namespace dnSpy.CallGraph.Controls {
 		Rect dragged_node_start;
 		Point dragged_node_pointer_start;
 		bool is_node_dragging;
+		int render_version;
+		Action? pending_render;
+		readonly Dictionary<object, HighlightedSnippet> pending_snippet_updates = new Dictionary<object, HighlightedSnippet>();
+		object? pending_root_key;
+		internal void CancelPendingRender() {
+			pending_render = null; pending_root_key = null; pending_snippet_updates.Clear();
+		}
+		readonly Dictionary<object, Point> manual_positions = new Dictionary<object, Point>();
+		static object ReferenceKey(object reference) => reference is ControlFlowBlock block ? (block.Method, block.StartOffset) : reference;
+
+		(object Key, Point Screen)? CaptureAnchor() {
+			var viewport = VisibleGraphRect();
+			var candidates = node_rects.Where(pair => pair.Value.IntersectsWith(viewport))
+				.OrderBy(pair => Equals(pair.Key, selected_reference) ? 0 : 1)
+				.ThenBy(pair => Math.Abs(pair.Value.Top - viewport.Top)).ToArray();
+			if (candidates.Length == 0) return null;
+			var anchor = candidates[0];
+			return (ReferenceKey(anchor.Key), new Point(pan_host.Padding.Left + anchor.Value.Left * Zoom - scroll_viewer.HorizontalOffset,
+				pan_host.Padding.Top + anchor.Value.Top * Zoom - scroll_viewer.VerticalOffset));
+		}
+
+		void RestoreAnchor((object Key, Point Screen)? anchor) {
+			if (anchor is null) return;
+			var match = node_rects.FirstOrDefault(pair => Equals(ReferenceKey(pair.Key), anchor.Value.Key));
+			if (match.Key is null) return;
+			scroll_viewer.UpdateLayout();
+			scroll_viewer.ScrollToHorizontalOffset(pan_host.Padding.Left + match.Value.Left * Zoom - anchor.Value.Screen.X);
+			scroll_viewer.ScrollToVerticalOffset(pan_host.Padding.Top + match.Value.Top * Zoom - anchor.Value.Screen.Y);
+		}
 
 		public event EventHandler<GraphReferenceEventArgs>? NavigateRequested;
 		public event EventHandler<GraphReferenceEventArgs>? RootRequested;
@@ -179,6 +208,7 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		internal void SetThemeService(IThemeService value) => theme_service = value;
+		internal bool IsShowing(MethodDef method) => !vertical_layout && ReferenceEquals(root_reference, method);
 		void UpdateExtent() {
 			extent_host.Width = Math.Max(1, canvas.Width * Zoom);
 			extent_host.Height = Math.Max(1, canvas.Height * Zoom);
@@ -197,6 +227,10 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		public void Clear(string? message = null) {
+			CancelPendingRender();
+			render_version++;
+			EndPan();
+			manual_positions.Clear();
 			visibility_timer.Stop();
 			edge_layer.InvalidateDrawing();
 			canvas.Children.Clear();
@@ -232,7 +266,7 @@ namespace dnSpy.CallGraph.Controls {
 				CallGraphIndex.DisplayName(node.Method))).ToArray();
 			var links = slice.Links.Select(link => new GraphLinkPresentation(
 				link.Source, link.Target, link.CallSiteCount, BuildLinkToolTip(link),
-				link.OpCodes.Contains("calli") ? "calli" : link.OpCodes.Contains("delegate invoke") ? "delegate" : link.OpCodes.Contains("reflection invoke") ? "reflection" : link.OpCodes.Contains("state machine") ? "async" : link.OpCodes.Contains("scheduled callback") ? "callback" : link.OpCodes.Contains("dynamic invoke") ? "dynamic" : string.Empty,
+				link.OpCodes.Contains("type initializer") ? ".cctor" : link.OpCodes.Contains("calli") ? "calli" : link.OpCodes.Contains("delegate invoke") ? "delegate" : link.OpCodes.Contains("reflection invoke") ? "reflection" : link.OpCodes.Contains("state machine") ? "async" : link.OpCodes.Contains("scheduled callback") ? "callback" : link.OpCodes.Contains("dynamic invoke") ? "dynamic" : string.Empty,
 				link.IsPotential ? GraphLinkKind.PossibleCall : GraphLinkKind.Call)).ToArray();
 			RenderCore(new GraphPresentation(nodes, links),
 				snippets.ToDictionary(pair => (object)pair.Key, pair => pair.Value),
@@ -240,12 +274,13 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		public void Render(ControlFlowGraph graph, int maximum_lines = 0) {
+			var snippets = graph.Blocks.ToDictionary(block => (object)block, block => block.GetSnippet(maximum_lines));
 			var nodes = graph.Blocks.Select(block => new GraphNodePresentation(
 				block, block.Layer, block.IsEntry, false,
 				block.Title,
 				block.IsEntry ? UiText.Pick("entry", "вход") + " • " + block.Description : block.Description,
 				$"{CallGraphIndex.Signature(block.Method)}\n{block.Title}–IL_{block.EndOffset:X4}",
-				block.Snippet.Text)).ToArray();
+				snippets[block].Text)).ToArray();
 			var links = graph.Edges.Select(edge => new GraphLinkPresentation(
 				edge.Source, edge.Target, 1,
 				$"{edge.Source.Title} → {edge.Target.Title}\n{edge.Kind}" +
@@ -258,12 +293,35 @@ namespace dnSpy.CallGraph.Controls {
 					_ => GraphLinkKind.Call,
 				})).ToArray();
 			RenderCore(new GraphPresentation(nodes, links),
-				graph.Blocks.ToDictionary(block => (object)block, block => block.Snippet.LimitLines(maximum_lines)),
+				snippets,
 				UiText.Pick("The selected method does not have a managed IL body.", "У выбранного метода нет управляемого IL-тела."), true);
 		}
 
 		void RenderCore(GraphPresentation graph, IReadOnlyDictionary<object, HighlightedSnippet> snippets,
 			string empty_message, bool use_vertical_layout) {
+			if (is_pan_candidate) {
+				var deferred_root = graph.Nodes.FirstOrDefault(node => node.IsRoot)?.Reference;
+				var deferred_key = deferred_root is null ? null : ReferenceKey(deferred_root);
+				if (!Equals(pending_root_key, deferred_key)) pending_snippet_updates.Clear();
+				pending_root_key = deferred_key;
+				pending_render = () => {
+					var latest = snippets.ToDictionary(pair => pair.Key, pair => pair.Value);
+					foreach (var pair in pending_snippet_updates)
+						if (latest.ContainsKey(pair.Key)) latest[pair.Key] = pair.Value;
+					pending_snippet_updates.Clear();
+					pending_root_key = null;
+					RenderCore(graph, latest, empty_message, use_vertical_layout);
+				};
+				return;
+			}
+			int version = ++render_version;
+			var next_root = graph.Nodes.FirstOrDefault(node => node.IsRoot)?.Reference;
+			bool preserve = root_reference is not null && next_root is not null && vertical_layout == use_vertical_layout &&
+				Equals(ReferenceKey(root_reference), ReferenceKey(next_root));
+			var anchor = preserve ? CaptureAnchor() : null;
+			var selected_key = preserve && selected_reference is not null ? ReferenceKey(selected_reference) : null;
+			EndPan();
+			if (!preserve) manual_positions.Clear();
 			canvas.Children.Clear();
 			node_borders.Clear();
 			cached_borders.Clear();
@@ -271,8 +329,8 @@ namespace dnSpy.CallGraph.Controls {
 			edge_visuals.Clear();
 			node_presentations.Clear();
 			node_snippets.Clear();
-			root_reference = graph.Nodes.FirstOrDefault(node => node.IsRoot)?.Reference;
-			selected_reference = root_reference;
+			root_reference = next_root;
+			selected_reference = graph.Nodes.FirstOrDefault(node => Equals(ReferenceKey(node.Reference), selected_key))?.Reference ?? root_reference;
 			vertical_layout = use_vertical_layout;
 
 			var layer_groups = graph.Nodes.GroupBy(node => node.Layer)
@@ -343,13 +401,26 @@ namespace dnSpy.CallGraph.Controls {
 				canvas.Height = Math.Max(CanvasMargin * 2 + maximum_column_height, 420);
 			}
 
+			foreach (var reference in node_rects.Keys.ToArray()) {
+				if (!manual_positions.TryGetValue(ReferenceKey(reference), out var position)) continue;
+				var rect = node_rects[reference]; rect.Location = position; node_rects[reference] = rect;
+			}
+			var live_keys = new HashSet<object>(node_rects.Keys.Select(ReferenceKey));
+			foreach (var key in manual_positions.Keys.Where(key => !live_keys.Contains(key)).ToArray()) manual_positions.Remove(key);
+			canvas.Width = Math.Max(canvas.Width, node_rects.Values.Max(rect => rect.Right + CanvasMargin));
+			canvas.Height = Math.Max(canvas.Height, node_rects.Values.Max(rect => rect.Bottom + CanvasMargin));
 			UpdateExtent();
 			canvas.Children.Add(edge_layer);
 			foreach (var link in graph.Links)
 				AddEdge(link);
 			edge_layer.InvalidateDrawing();
 
-			Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => { CenterRoot(); UpdateVisibleNodes(); }));
+			if (preserve) RestoreAnchor(anchor);
+			Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => {
+				if (version != render_version) return;
+				if (!preserve && !is_pan_candidate) CenterRoot();
+				UpdateVisibleNodes();
+			}));
 		}
 
 		Rect VisibleGraphRect() {
@@ -396,8 +467,10 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		public void UpdateSnippets(IReadOnlyDictionary<MethodDef, HighlightedSnippet> snippets) {
+			var anchor = CaptureAnchor();
 			bool geometry_changed = false;
 			foreach (var pair in snippets) {
+				if (pending_render is not null) pending_snippet_updates[pair.Key] = pair.Value;
 				if (!node_rects.TryGetValue(pair.Key, out var old_rect) ||
 					node_snippets.TryGetValue(pair.Key, out var previous) && ReferenceEquals(previous, pair.Value)) continue;
 				node_snippets[pair.Key] = pair.Value;
@@ -413,6 +486,7 @@ namespace dnSpy.CallGraph.Controls {
 				geometry_changed = true;
 				foreach (var reference in node_rects.Keys.ToArray()) {
 					if (Equals(reference, pair.Key)) continue;
+					if (Equals(reference, dragged_node_reference) || manual_positions.ContainsKey(ReferenceKey(reference))) continue;
 					var rect = node_rects[reference];
 					if (Math.Abs(rect.Left - old_rect.Left) > 0.5 || rect.Top <= old_rect.Top) continue;
 					rect.Y += delta; node_rects[reference] = rect;
@@ -421,6 +495,7 @@ namespace dnSpy.CallGraph.Controls {
 			}
 			canvas.Height = Math.Max(420, node_rects.Values.Select(rect => rect.Bottom + CanvasMargin).DefaultIfEmpty(420).Max());
 			UpdateExtent();
+			RestoreAnchor(anchor);
 			if (geometry_changed) {
 				foreach (var visual in edge_visuals) UpdateEdge(visual);
 				edge_layer.InvalidateDrawing();
@@ -937,6 +1012,9 @@ namespace dnSpy.CallGraph.Controls {
 			Cursor = Cursors.Arrow;
 			if (had_capture)
 				Mouse.Capture(null);
+			var pending = pending_render;
+			pending_render = null;
+			pending?.Invoke();
 		}
 
 		object? FindNodeReference(DependencyObject? source) {
@@ -960,6 +1038,7 @@ namespace dnSpy.CallGraph.Controls {
 		}
 
 		void MoveNode(object reference, double left, double top) {
+			manual_positions[ReferenceKey(reference)] = new Point(left, top);
 			if (!node_rects.TryGetValue(reference, out var old_rect) || !node_borders.TryGetValue(reference, out var border))
 				return;
 			var rect = new Rect(left, top, old_rect.Width, old_rect.Height);
