@@ -8,6 +8,8 @@ Call Graph is a dnSpyEx extension that adds three complementary views for analyz
 
 The extension opens as a standard dnSpy document tab. It can be docked next to the decompiler, moved to another tab group, or placed where the decompiler normally appears.
 
+**Binary Size Analysis** opens in a separate window to show which parts of an assembly or module take up space on disk.
+
 ## GUI
 
 ### Call Blocks
@@ -22,6 +24,18 @@ The extension opens as a standard dnSpy document tab. It can be docked next to t
 
 ![IL control-flow graph with basic blocks and directed edges](docs/images/cfg.jpg)
 
+### Binary Size Analysis
+
+See what takes up space in a binary, then drill down from PE sections to individual methods.
+
+**Contents of a PE section:**
+
+![Binary size analysis showing the managed bodies, metadata, and other contents of the selected PE section](docs/images/binary-size-section.png)
+
+**Class sizes inside a namespace:**
+
+![Binary size analysis comparing class sizes inside the selected namespace](docs/images/binary-size-classes.png)
+
 ## Features
 
 - `Callees`, `Callers`, and `Both` graph directions;
@@ -30,6 +44,7 @@ The extension opens as a standard dnSpy document tab. It can be docked next to t
 - C# and IL inside blocks, using colors from the current dnSpy theme;
 - a Function Map capable of displaying up to 2,000 methods;
 - a CFG with branch, switch, fall-through, and exception edges;
+- binary size analysis with a color-coded treemap of PE sections, metadata, resources, classes, and methods;
 - method search by name, declaring type, or full signature;
 - graph depth from 1 to 8;
 - independent limits for Call Blocks, Function Map, and CFG;
@@ -76,6 +91,21 @@ Block leaders include:
 - exception-handler boundaries.
 
 Double-clicking a referenced method name rebuilds the CFG for that method. Opening the method in the standard decompiler is available explicitly through the context menu.
+
+### Binary Size Analysis
+
+Right-click an **assembly or module** in Assembly Explorer and select **Analyze file size…** (`Проанализировать размер…` in Russian).
+
+The window combines a structure tree with an interactive treemap. Each rectangle's area represents its size in bytes; colors match the markers in the tree. Select or expand a heading to see only its immediate contents:
+
+**File → PE sections → categories → namespaces → classes → methods.**
+
+- Inspect section data, CLR metadata, embedded resources, managed method bodies, and data outside PE sections.
+- Read exact byte counts and percentages in the tree; hover over a rectangle for its full path and size.
+- Double-click a map group to drill down. Use **Back**, **Up**, **Whole file**, or the clickable path to navigate.
+- Double-click a method or use **Go to method** to open its code in the dnSpy decompiler.
+
+The analysis measures the **file on disk**, not runtime memory or unsaved edits. Shared method bodies are counted once, and unrecognized data remains visible in the total. Metadata is listed separately from method bodies. No analyzed code is executed.
 
 ## Graph Directions
 
